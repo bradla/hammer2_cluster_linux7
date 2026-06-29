@@ -1,0 +1,31 @@
+core*
+*.swp
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+
+# executable binaries
+src/sbin/hammer/hammer
+src/sbin/hammer/test_dupkey
+src/sbin/newfs_hammer/newfs_hammer
+src/sbin/mount_hammer/mount_hammer
+src/sbin/hammer2/hammer2
+src/sbin/newfs_hammer2/newfs_hammer2
+src/sbin/mount_hammer2/mount_hammer2
+src/sbin/fsck_hammer2/fsck_hammer2
+src/usr.bin/undo/undo
+src/usr.sbin/fstyp/fstyp
+
+# diff dragonfly lh1
+src/lh1.diff
