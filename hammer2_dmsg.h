@@ -814,6 +814,7 @@ struct kdmsg_iocom {
 	int			msg_ctl;	/* wakeup flags */
 	int			msg_seq;	/* cluster msg sequence id */
 	uint32_t		flags;
+	wait_queue_head_t	msg_waitq;	/* Linux: tx-thread wakeup (port) */
 	struct lock		msglk;		/* lockmgr lock */
 	TAILQ_HEAD(, kdmsg_msg) msgq;		/* transmit queue */
 	void			*handle;

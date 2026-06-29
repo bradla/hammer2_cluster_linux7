@@ -39,6 +39,7 @@
 #include "hammer2_ioctl.h"
 #include "hammer2_mount.h"
 #include <linux/fs.h>
+#include <linux/file.h>
 #include <linux/uaccess.h>
 #include <linux/blkdev.h>
 #include <linux/buffer_head.h>
@@ -75,6 +76,44 @@ hammer2_ioctl_version_get(hammer2_inode_t *ip, void *data)
 		v->version = -1;
 
 	return (0);
+}
+
+/*
+ * Associate a connected file descriptor with the mounted HAMMER2 device,
+ * engaging the kdmsg cluster transport (hammer2_cluster_reconnect()).  The
+ * fd is a socket/pipe connected to the userland `hammer2 service` DMSG daemon.
+ *
+ * Linux port: DragonFly's holdfp(curthread, fd, -1) -> fget(fd).  On success
+ * the file reference is handed to the iocom (kdmsg_iocom_reconnect owns it and
+ * releases it at teardown); on failure we drop it here.
+ */
+static int
+hammer2_ioctl_recluster(hammer2_inode_t *ip, void *data)
+{
+	hammer2_ioc_recluster_t *recl = data;
+	hammer2_cluster_t *cluster;
+	struct file *fp;
+	int error;
+
+	fp = fget(recl->fd);
+	if (fp == NULL)
+		return (EINVAL);
+
+	cluster = &ip->pmp->iroot->cluster;
+	if (cluster->focus != NULL) {
+		hammer2_cluster_reconnect(cluster->focus->hmp, fp);
+		error = 0;
+	} else if (cluster->nchains == 1 &&
+		   cluster->array[0].chain != NULL) {
+		hammer2_cluster_reconnect(cluster->array[0].chain->hmp, fp);
+		error = 0;
+	} else {
+		hprintf("recluster: nchains=%d focus=%p\n",
+			cluster->nchains, cluster->focus);
+		fput(fp);
+		error = EINVAL;
+	}
+	return (error);
 }
 
 /*
@@ -1084,6 +1123,9 @@ hammer2_ioctl_impl(struct vnode *vp, unsigned long com, void *data, int fflag,
 	switch (com) {
 	case HAMMER2IOC_VERSION_GET:
 		error = hammer2_ioctl_version_get(ip, data);
+		break;
+	case HAMMER2IOC_RECLUSTER:
+		error = hammer2_ioctl_recluster(ip, data);
 		break;
 	case HAMMER2IOC_PFS_GET:
 		error = hammer2_ioctl_pfs_get(ip, data);

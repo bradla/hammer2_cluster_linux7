@@ -61,6 +61,19 @@ struct hammer2_ioc_version {
 typedef struct hammer2_ioc_version hammer2_ioc_version_t;
 
 /*
+ * Associate a connected file descriptor (a socket/pipe to the userland
+ * `hammer2 service` DMSG daemon) with the mounted HAMMER2 device, engaging
+ * the kdmsg cluster transport.  Must be layout-identical to DragonFly's
+ * struct hammer2_ioc_recluster (256 bytes) so the userland tool agrees.
+ */
+struct hammer2_ioc_recluster {
+	int			fd;
+	char			reserved[256 - 4];
+};
+
+typedef struct hammer2_ioc_recluster hammer2_ioc_recluster_t;
+
+/*
  * Ioctls to manage PFSs.
  *
  * PFSs can be clustered by matching their pfs_clid, and the PFSs making up
@@ -228,6 +241,7 @@ typedef struct hammer2_ioc_volume_list2 hammer2_ioc_volume_list2_t;
  * validation with "not a hammer2 filesystem".
  */
 #define HAMMER2IOC_VERSION_GET		HAMMER2_IOWR('h', 64, struct hammer2_ioc_version)
+#define HAMMER2IOC_RECLUSTER		HAMMER2_IOWR('h', 65, struct hammer2_ioc_recluster)
 #define HAMMER2IOC_PFS_GET		HAMMER2_IOWR('h', 80, struct hammer2_ioc_pfs)
 #define HAMMER2IOC_PFS_CREATE		HAMMER2_IOWR('h', 81, struct hammer2_ioc_pfs)
 #define HAMMER2IOC_PFS_DELETE		HAMMER2_IOWR('h', 82, struct hammer2_ioc_pfs)

@@ -60,6 +60,7 @@
 #include <linux/uio.h>
 #include <linux/err.h>
 #include <linux/jiffies.h>
+#include <linux/wait.h>
 #include <linux/net.h>
 #include <net/sock.h>
 
@@ -282,6 +283,7 @@ kdmsg_iocom_init(kdmsg_iocom_t *iocom, void *handle, uint32_t flags,
 	iocom->rcvmsg = rcvmsg;
 	iocom->flags = flags;
 	lockinit(&iocom->msglk, "h2msg", 0, 0);
+	init_waitqueue_head(&iocom->msg_waitq);
 	TAILQ_INIT(&iocom->msgq);
 	RB_INIT(&iocom->staterd_tree);
 	RB_INIT(&iocom->statewr_tree);
@@ -305,7 +307,7 @@ kdmsg_iocom_reconnect(kdmsg_iocom_t *iocom, struct file *fp,
 	lockmgr(&iocom->msglk, LK_EXCLUSIVE);
 	atomic_set_int(&iocom->msg_ctl, KDMSG_CLUSTERCTL_KILLRX);
 	while (iocom->msgrd_td || iocom->msgwr_td) {
-		wakeup(&iocom->msg_ctl);
+		wake_up(&iocom->msg_waitq);
 		lksleep(iocom, &iocom->msglk, 0, "clstrkl", hz);
 	}
 
@@ -355,6 +357,8 @@ kdmsg_iocom_autoinitiate(kdmsg_iocom_t *iocom,
 	iocom->conn_state = msg->state;
 	kdmsg_state_hold(msg->state);	/* iocom->conn_state */
 	kdmsg_msg_write(msg);
+	hprintf("DMSGTRACE autoinit queued LNK_CONN cmd=%08x\n",
+		msg->any.head.cmd);
 }
 
 static
@@ -448,7 +452,7 @@ kdmsg_iocom_uninit(kdmsg_iocom_t *iocom)
 
 	retries = 10;
 	while (iocom->msgrd_td || iocom->msgwr_td) {
-		wakeup(&iocom->msg_ctl);
+		wake_up(&iocom->msg_waitq);
 		lksleep(iocom, &iocom->msglk, 0, "clstrkl", hz);
 		if (--retries == 0 && iocom->msg_fp) {
 			kdio_printf(iocom, 0, "%s\n",
@@ -504,6 +508,8 @@ kdmsg_iocom_thread_rd(void *arg)
 		 */
 		error = fp_read(iocom->msg_fp, &hdr, sizeof(hdr),
 				NULL, 1, UIO_SYSSPACE);
+		hprintf("DMSGTRACE RD hdr err=%d magic=%04x cmd=%08x\n",
+			error, error ? 0 : hdr.magic, error ? 0 : hdr.cmd);
 		if (error)
 			break;
 		if (hdr.magic != DMSG_HDR_MAGIC) {
@@ -578,7 +584,7 @@ kdmsg_iocom_thread_rd(void *arg)
 					KDMSG_CLUSTERCTL_KILLTX);
 	iocom->msgrd_td = NULL;
 	lockmgr(&iocom->msglk, LK_RELEASE);
-	wakeup(&iocom->msg_ctl);
+	wake_up(&iocom->msg_waitq);
 
 	/*
 	 * iocom can be ripped out at any time once the lock is
@@ -613,9 +619,20 @@ kdmsg_iocom_thread_wr(void *arg)
 		 * holding msglk.
 		 */
 		if (TAILQ_EMPTY(&iocom->msgq)) {
+			/*
+			 * Linux port: sleep interruptibly on the iocom's
+			 * waitqueue (not uninterruptible tsleep) so the tx
+			 * thread wakes immediately when a message is queued
+			 * (wake_up below) or KILLTX is set, and stays killable.
+			 * The 1s timeout is just a safety backstop.
+			 */
 			atomic_set_int(&iocom->msg_ctl,
 				       KDMSG_CLUSTERCTL_SLEEPING);
-			lksleep(&iocom->msg_ctl, &iocom->msglk, 0, "msgwr", hz);
+			lockmgr(&iocom->msglk, LK_RELEASE);
+			wait_event_interruptible_timeout(iocom->msg_waitq,
+			    !TAILQ_EMPTY(&iocom->msgq) ||
+			    (iocom->msg_ctl & KDMSG_CLUSTERCTL_KILLTX), hz);
+			lockmgr(&iocom->msglk, LK_EXCLUSIVE);
 			atomic_clear_int(&iocom->msg_ctl,
 					 KDMSG_CLUSTERCTL_SLEEPING);
 		}
@@ -647,6 +664,9 @@ kdmsg_iocom_thread_wr(void *arg)
 			lockmgr(&iocom->msglk, LK_RELEASE);
 			error = fp_write(iocom->msg_fp, &msg->any,
 					 msg->hdr_size, &res, UIO_SYSSPACE);
+			hprintf("DMSGTRACE WR cmd=%08x hdr=%zu err=%d res=%zd\n",
+				msg->any.head.cmd, msg->hdr_size, error,
+				(ssize_t)res);
 			if (error || res != msg->hdr_size) {
 				if (error == 0)
 					error = EINVAL;
@@ -684,7 +704,7 @@ kdmsg_iocom_thread_wr(void *arg)
 	fp_shutdown(iocom->msg_fp, SHUT_RDWR);
 	atomic_set_int(&iocom->msg_ctl, KDMSG_CLUSTERCTL_KILLRX |
 					KDMSG_CLUSTERCTL_KILLTX);
-	wakeup(&iocom->msg_ctl);
+	wake_up(&iocom->msg_waitq);
 
 	/*
 	 * The transmit thread is responsible for final cleanups, wait
@@ -694,7 +714,7 @@ kdmsg_iocom_thread_wr(void *arg)
 	 * Do not set msgwr_td to NULL until we actually exit.
 	 */
 	while (iocom->msgrd_td) {
-		wakeup(&iocom->msg_ctl);
+		wake_up(&iocom->msg_waitq);
 		lksleep(iocom, &iocom->msglk, 0, "clstrkt", hz);
 	}
 
@@ -2189,7 +2209,7 @@ kdmsg_msg_write_locked(kdmsg_iocom_t *iocom, kdmsg_msg_t *msg)
 	if (iocom->msg_ctl & KDMSG_CLUSTERCTL_SLEEPING) {
 		atomic_clear_int(&iocom->msg_ctl,
 				 KDMSG_CLUSTERCTL_SLEEPING);
-		wakeup(&iocom->msg_ctl);
+		wake_up(&iocom->msg_waitq);
 	}
 }
 
