@@ -1,0 +1,66 @@
+# .gitignore for the HAMMER2 Linux port.
+#
+# Policy: track ONLY source code (*.c, *.h, *.S) and build files
+# (Makefile / Kbuild / *.mk).  Everything else -- kernel build artifacts,
+# scratch logs, editor files, backups, generated reports, vendored git
+# metadata -- is ignored so a push carries just the sources.
+#
+# This is a whitelist: ignore everything, then re-include what we keep.
+# Order matters (later rules win).
+
+# 1) Ignore everything by default...
+*
+
+# 2) ...but still descend into subdirectories so nested sources are seen.
+!*/
+
+# 3) Keep source code.
+!*.c
+!*.h
+!*.S
+
+# 4) Keep build files.
+!Makefile
+!GNUmakefile
+!Kbuild
+!*.mk
+
+# 5) Keep this ignore file (and .gitattributes if you add one).
+!.gitignore
+!.gitattributes
+
+# ---------------------------------------------------------------------------
+# Defensive re-ignores: generated files that would otherwise slip through the
+# source-code whitelist above (e.g. Kbuild's *.mod.c is a real .c file).
+# ---------------------------------------------------------------------------
+
+# Kernel module build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.o.cmd
+*.ko.cmd
+.*.cmd
+*.symvers
+*.order
+modules.order
+Module.symvers
+.tmp_versions/
+built-in.a
+*.a
+
+# Vendored git metadata (lh1/ ships its own repo)
+lh1/.git/
+
+# Editors / tags / workspaces
+tags
+*.code-workspace
+*.swp
+
+# Backups / scratch left over from debugging
+*.bak
+*.last
+*.orig
+*.rej
