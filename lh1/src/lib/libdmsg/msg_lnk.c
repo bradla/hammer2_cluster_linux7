@@ -327,7 +327,25 @@ RB_GENERATE_STATIC(h2span_relay_tree, h2span_relay,
 /*
  * Global mutex protects cluster_tree lookups, connq, mediaq.
  */
+/*
+ * Linux port: cluster_mtx must be RECURSIVE.  dmsg_rnss() locks cluster_mtx,
+ * but it is called from dmsg_generate_relay() which runs under cluster_mtx
+ * already held (dmsg_msg_lnk_signal -> dmsg_relay_scan).  On DragonFly the
+ * default mutex tolerates same-thread recursion; glibc's default NORMAL mutex
+ * hard-deadlocks on the first relay (when DMsgRNSS == 0).  Same fix class as
+ * the recursive iocom->mtx.  Initialize recursive at load time (a plain
+ * PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP would require _GNU_SOURCE).
+ */
 static pthread_mutex_t cluster_mtx;
+static __attribute__((constructor)) void
+cluster_mtx_init(void)
+{
+	pthread_mutexattr_t attr;
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+	pthread_mutex_init(&cluster_mtx, &attr);
+	pthread_mutexattr_destroy(&attr);
+}
 static struct h2span_cluster_tree cluster_tree = RB_INITIALIZER(cluster_tree);
 static struct h2span_conn_queue connq = TAILQ_HEAD_INITIALIZER(connq);
 static struct dmsg_media_queue mediaq = TAILQ_HEAD_INITIALIZER(mediaq);

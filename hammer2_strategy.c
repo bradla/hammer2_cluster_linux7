@@ -218,7 +218,17 @@ hammer2_xop_strategy_read(hammer2_xop_t *arg, void *scratch, int clindex)
 	parent = NULL; /* safety */
 
 	bp = xop->bp;
-	error = hammer2_xop_collect(&xop->head, HAMMER2_XOP_COLLECT_NOWAIT);
+	/*
+	 * Collect the result.  A NOWAIT collect can return EINPROGRESS when the
+	 * cluster op is not yet complete (multi-node); keep collecting until the
+	 * result is definitive so EINPROGRESS is never misreported as EIO.  In
+	 * the single-node inline model the op is already complete, so this
+	 * iterates exactly once.
+	 */
+	do {
+		error = hammer2_xop_collect(&xop->head,
+		    HAMMER2_XOP_COLLECT_NOWAIT);
+	} while (error == HAMMER2_ERROR_EINPROGRESS);
 	switch (error) {
 	case 0:
 		data = ((const hammer2_media_data_t *)hammer2_xop_gdata(&xop->head))->buf;
@@ -358,7 +368,11 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
 	}
 	hammer2_xop_feed(&xop->head, NULL, clindex, error);
 
-	error = hammer2_xop_collect(&xop->head, HAMMER2_XOP_COLLECT_NOWAIT);
+	/* Keep collecting past EINPROGRESS (multi-node); iterates once inline. */
+	do {
+		error = hammer2_xop_collect(&xop->head,
+		    HAMMER2_XOP_COLLECT_NOWAIT);
+	} while (error == HAMMER2_ERROR_EINPROGRESS);
 	bp = xop->bp; /* now owned by us */
 	if (error == HAMMER2_ERROR_ENOENT || error == 0) {
 		bp->b_resid = 0;

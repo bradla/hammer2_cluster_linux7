@@ -42,7 +42,7 @@
  * automatically so two builds of the same version number are still
  * distinguishable.
  */
-#define HAMMER2_PORT_VERSION	"0.34"
+#define HAMMER2_PORT_VERSION	"0.37"
 #define HAMMER2_PORT_BUILD	HAMMER2_PORT_VERSION " built " __DATE__ " " __TIME__
 
 /* BSD-shaped vfsops entry points (un-static'd in hammer2_vfsops.c). */
@@ -602,6 +602,15 @@ hammer2_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	if (pmp->rdonly || (pmp->flags & HAMMER2_PMPF_EMERG))
 		return -EROFS;
+
+	/*
+	 * Dirty-chain write throttle (DragonFly .vfs_modifying equivalent).
+	 * Drains the modified-chain backlog inline if it has grown past the
+	 * limit, providing backpressure so heavy sustained writes cannot
+	 * accumulate dirty chains without bound.  Called before inode_lock so
+	 * the inline flush cannot deadlock against our own inode lock.
+	 */
+	hammer2_pfs_memory_wait(pmp);
 
 	inode_lock(inode);
 
@@ -1214,6 +1223,24 @@ hammer2_linux_statfs(struct dentry *dentry, struct kstatfs *buf)
 	buf->f_bfree = h2->f_bfree;
 	buf->f_bavail = h2->f_bavail;
 	buf->f_files = h2->f_files;
+
+	/*
+	 * DragonFly withholds the ~5% reserve from non-root callers (keyed on
+	 * cred->cr_uid).  On Linux f_bavail is precisely "space available to
+	 * unprivileged users", so hold the reserve back from callers without
+	 * CAP_SYS_RESOURCE; privileged callers see full free space and may
+	 * write into the reserve (the write-path enospace check enforces the
+	 * same boundary).  f_bfree/f_blocks stay the raw totals.
+	 */
+	if (!capable(CAP_SYS_RESOURCE)) {
+		hammer2_dev_t *hmp = pmp->pfs_hmps[0];
+		u64 reserve = hmp ? (hmp->free_reserved / HAMMER2_PBUFSIZE) : 0;
+
+		if (buf->f_bavail > reserve)
+			buf->f_bavail -= reserve;
+		else
+			buf->f_bavail = 0;
+	}
 	buf->f_ffree = h2->f_ffree;
 	buf->f_namelen = HAMMER2_INODE_MAXNAME;
 	kfree(h2);

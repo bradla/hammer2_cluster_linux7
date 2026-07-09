@@ -248,6 +248,7 @@ shell_ttymsg(dmsg_iocom_t *iocom)
  */
 static void shell_span(dmsg_msg_t *msg, char *cmdbuf);
 static void shell_ping(dmsg_msg_t *msg, char *cmdbuf);
+static void shell_readfile(dmsg_msg_t *msg, char *cmdbuf);
 
 void
 hammer2_shell_parse(dmsg_msg_t *msg, int unmanaged)
@@ -291,15 +292,59 @@ hammer2_shell_parse(dmsg_msg_t *msg, int unmanaged)
 		shell_span(msg, cmdbuf);
 	} else if (strcmp(cmdp, "tree") == 0) {
 		dmsg_shell_tree(iocom, cmdbuf); /* dump spanning tree */
+	} else if (strcmp(cmdp, "readfile") == 0) {
+		shell_readfile(msg, cmdbuf);	/* mock sync: stream a file */
+		return;				/* no trailing "debug> " in stream */
 	} else if (strcmp(cmdp, "help") == 0 || strcmp(cmdp, "?") == 0) {
 		dmsg_printf(iocom, "help            Command help\n");
 		dmsg_printf(iocom, "span <host>     Span to target host\n");
 		dmsg_printf(iocom, "tree            Dump spanning tree\n");
+		dmsg_printf(iocom, "readfile <path> Stream a file back (mock sync)\n");
 		dmsg_printf(iocom, "@span <cmd>     Issue via circuit\n");
 	} else {
 		dmsg_printf(iocom, "Unrecognized command: %s\n", cmdp);
 	}
 	dmsg_printf(iocom, "debug> ");
+}
+
+/*
+ * Mock master/slave sync primitive.  Server side: read a file from the local
+ * (master) filesystem and stream its contents back to the requesting (slave)
+ * node over the DMSG circuit as raw DBG_SHELL|REPLY aux_data chunks.  This
+ * proves node-to-node data transfer over the proven DMSG transport without the
+ * (unbuilt) kernel cluster-XOP-over-DMSG path.  Small files (a "small copy").
+ */
+static void
+shell_readfile(dmsg_msg_t *msg, char *cmdbuf)
+{
+	dmsg_iocom_t *iocom = msg->state->iocom;
+	dmsg_msg_t *rmsg;
+	const char *path = strsep(&cmdbuf, " \t");
+	char buf[8192];
+	int fd;
+	int n;
+	size_t total = 0;
+
+	if (path == NULL || *path == 0) {
+		dmsg_printf(iocom, "readfile: usage: readfile <path>\n");
+		return;
+	}
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		dmsg_printf(iocom, "readfile: cannot open %s: %s\n",
+			    path, strerror(errno));
+		return;
+	}
+	while ((n = read(fd, buf, sizeof(buf))) > 0) {
+		rmsg = dmsg_msg_alloc(msg->state, n,
+				      DMSG_DBG_SHELL | DMSGF_REPLY, NULL, NULL);
+		bcopy(buf, rmsg->aux_data, n);
+		dmsg_msg_write(rmsg);
+		total += n;
+	}
+	close(fd);
+	fprintf(stderr, "readfile: streamed %zu bytes of %s to peer\n",
+		total, path);
 }
 
 static void
@@ -358,9 +403,34 @@ shell_span(dmsg_msg_t *msg, char *cmdbuf)
  * Connect to the target manually (not via the cluster list embedded in
  * a hammer2 filesystem) and initiate the SPAN protocol.
  */
+/*
+ * Minimal message handler for debugspan.  dmsg_lnk_conn() and the iocom
+ * core call iocom->usrmsg_callback() unconditionally, so it must be
+ * non-NULL.  We are a passive SPAN observer: log the CONN/SPAN traffic and
+ * refuse (NOSUPP) any unmanaged user message so the peer is never left
+ * waiting on a reply.
+ */
+static void
+debugspan_msg_callback(dmsg_msg_t *msg, int unmanaged)
+{
+	switch (msg->tcmd) {
+	case DMSG_LNK_CONN | DMSGF_CREATE:
+		fprintf(stderr, "debugspan: received LNK_CONN\n");
+		break;
+	case DMSG_LNK_SPAN | DMSGF_CREATE:
+		fprintf(stderr, "debugspan: received LNK_SPAN\n");
+		break;
+	default:
+		break;
+	}
+	if (unmanaged)
+		dmsg_msg_reply(msg, DMSG_ERR_NOSUPP);
+}
+
 int
 cmd_debugspan(const char *hostname)
 {
+	dmsg_master_service_info_t *info;
 	pthread_t thread;
 	int fd;
 	void *res;
@@ -373,10 +443,118 @@ cmd_debugspan(const char *hostname)
 		return 1;
 
 	printf("debugspan: connected to %s, starting CONN/SPAN\n", hostname);
-	pthread_create(&thread, NULL,
-		       dmsg_master_service, (void *)(intptr_t)fd);
+
+	/*
+	 * dmsg_master_service() expects a heap-allocated info struct, not a
+	 * raw fd.  Upstream passes (void *)fd here and immediately faults on
+	 * info->detachme; build a proper info struct like cmd_shell() does.
+	 * The CONN/SPAN protocol is auto-initiated inside the service thread.
+	 */
+	info = malloc(sizeof(*info));
+	bzero(info, sizeof(*info));
+	info->fd = fd;
+	info->detachme = 0;
+	info->label = strdup("debugspan");
+	info->usrmsg_callback = debugspan_msg_callback;
+	pthread_create(&thread, NULL, dmsg_master_service, info);
 	pthread_join(thread, &res);
 	return(0);
+}
+
+/************************************************************************
+ *				PULLFILE				*
+ ************************************************************************
+ *
+ * Mock master/slave sync client.  Connect to a peer node's `hammer2 service`
+ * over DMSG, ask it (via the readfile shell command) to stream a file from its
+ * mount, and write the received bytes to a local path (e.g. the slave's mount).
+ * A real, binary-safe cross-node file copy over the proven DMSG circuit.
+ */
+static struct {
+	int		outfd;
+	const char	*remotepath;
+	size_t		total;
+} PullCtx;
+
+static void
+pullfile_msg_callback(dmsg_msg_t *msg, int unmanaged)
+{
+	dmsg_iocom_t *iocom = msg->state->iocom;
+	dmsg_msg_t *rmsg;
+	char cmd[1024];
+	int len;
+
+	switch (msg->tcmd) {
+	case DMSG_LNK_CONN | DMSGF_CREATE:
+		/*
+		 * Link is up: issue "readfile <remotepath>" as a DBG_SHELL
+		 * command.  The peer service dispatches it to shell_readfile()
+		 * which streams the file back as DBG_SHELL|REPLY chunks.
+		 */
+		len = snprintf(cmd, sizeof(cmd), "readfile %s",
+			       PullCtx.remotepath) + 1;
+		rmsg = dmsg_msg_alloc(&iocom->state0, len,
+				      DMSG_DBG_SHELL, NULL, NULL);
+		bcopy(cmd, rmsg->aux_data, len);
+		dmsg_msg_write(rmsg);
+		fprintf(stderr, "pullfile: requested '%s' from peer\n",
+			PullCtx.remotepath);
+		break;
+	case DMSG_DBG_SHELL | DMSGF_REPLY:
+		/*
+		 * A chunk of file data (binary-safe: use aux_size, not strlen).
+		 */
+		if (msg->aux_size && PullCtx.outfd >= 0) {
+			write(PullCtx.outfd, msg->aux_data, msg->aux_size);
+			PullCtx.total += msg->aux_size;
+		}
+		break;
+	default:
+		if (unmanaged)
+			dmsg_msg_reply(msg, DMSG_ERR_NOSUPP);
+		break;
+	}
+}
+
+int
+cmd_pullfile(const char *hostname, const char *remotepath, const char *localpath)
+{
+	dmsg_master_service_info_t *info;
+	pthread_t thread;
+	int fd;
+
+	fd = dmsg_connect(hostname);
+	if (fd < 0) {
+		fprintf(stderr, "pullfile: connect to %s failed\n", hostname);
+		return 1;
+	}
+	PullCtx.outfd = open(localpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (PullCtx.outfd < 0) {
+		fprintf(stderr, "pullfile: cannot create %s: %s\n",
+			localpath, strerror(errno));
+		close(fd);
+		return 1;
+	}
+	PullCtx.remotepath = remotepath;
+	PullCtx.total = 0;
+
+	printf("pullfile: %s:%s -> %s\n", hostname, remotepath, localpath);
+	info = malloc(sizeof(*info));
+	bzero(info, sizeof(*info));
+	info->fd = fd;
+	info->detachme = 1;
+	info->usrmsg_callback = pullfile_msg_callback;
+	info->label = strdup("pullfile");
+	pthread_create(&thread, NULL, dmsg_master_service, info);
+
+	/*
+	 * Collect for a few seconds (small file), then finalize.  A production
+	 * path would use an explicit end-of-file marker/transaction close.
+	 */
+	sleep(3);
+	close(PullCtx.outfd);
+	printf("pullfile: wrote %zu bytes to %s\n", PullCtx.total, localpath);
+	return (PullCtx.total > 0 ? 0 : 1);
 }
 
 /************************************************************************
@@ -410,19 +588,26 @@ get_next_volume(hammer2_volume_data_t *voldata, hammer2_off_t volu_loff)
 	return ret;
 }
 
+/*
+ * show device_path [chainspec]
+ *
+ * chainspec is a bref specification like  000001559a68900a.01,
+ * which is basically an offset with an embedded blocksize and
+ * the type.
+ */
 int
-cmd_show(const char *devpath, int which)
+cmd_show(const char *devpath, const char *chspec, int which)
 {
 	hammer2_blockref_t broot;
-	hammer2_blockref_t best;
 	hammer2_media_data_t media;
-	hammer2_media_data_t best_media;
 	hammer2_off_t off, volu_loff, next_volu_loff = 0;
+	hammer2_tid_t best_mirror_tid = 0;
+	int bests[HAMMER2_MAX_VOLUMES];
 	int fd;
-	int i;
-	int best_i;
+	int i, j;
 	char *env;
 
+	memset(bests, 0xff, sizeof(bests));
 	memset(TotalAccum16, 0, sizeof(TotalAccum16));
 	memset(TotalAccum64, 0, sizeof(TotalAccum64));
 	TotalUnavail = TotalFreemap = 0;
@@ -432,109 +617,129 @@ cmd_show(const char *devpath, int which)
 		show_all_volume_headers = (int)strtol(env, NULL, 0);
 		if (errno)
 			show_all_volume_headers = 0;
+		errno = 0;
 	}
 	env = getenv("HAMMER2_SHOW_TAB");
 	if (env != NULL) {
 		show_tab = (int)strtol(env, NULL, 0);
 		if (errno || show_tab < 0 || show_tab > 8)
 			show_tab = 2;
+		errno = 0;
 	}
 	env = getenv("HAMMER2_SHOW_DEPTH");
 	if (env != NULL) {
 		show_depth = (int)strtol(env, NULL, 0);
 		if (errno || show_depth < 0)
 			show_depth = -1;
+		errno = 0;
 	}
 	env = getenv("HAMMER2_SHOW_MIN_MIRROR_TID");
 	if (env != NULL) {
 		show_min_mirror_tid = (hammer2_tid_t)strtoull(env, NULL, 16);
 		if (errno)
 			show_min_mirror_tid = 0;
+		errno = 0;
 	}
 	env = getenv("HAMMER2_SHOW_MIN_MODIFY_TID");
 	if (env != NULL) {
 		show_min_modify_tid = (hammer2_tid_t)strtoull(env, NULL, 16);
 		if (errno)
 			show_min_modify_tid = 0;
+		errno = 0;
 	}
 
 	hammer2_init_volumes(devpath, 1);
 	int all_volume_headers = VerboseOpt >= 3 || show_all_volume_headers;
-next_volume:
-	volu_loff = next_volu_loff;
-	next_volu_loff = -1;
-	printf("%s\n", hammer2_get_volume_path(volu_loff));
+
+	/*
+	 * If chspec is non-NULL, construct a bref out of the spec
+	 */
+	if (chspec) {
+		int btype;
+		long boff;
+		if (sscanf(chspec, "%jx.%02x", &boff, &btype) != 2) {
+			fprintf(stderr, "bad chainspec: %%llx.%%02x\n");
+			goto done;
+		}
+		bzero(&broot, sizeof(broot));
+		broot.data_off = boff;
+		broot.type = btype;
+		broot.methods = HAMMER2_ENC_CHECK(HAMMER2_CHECK_XXHASH64);
+
+		show_bref(&media.voldata, 0, 0, &broot, 0);
+		goto done;
+	}
+
+	/*
+	 * Get best volume header for all volumes first.
+	 */
+	volu_loff = 0;
+	for (i = 0; i < HAMMER2_MAX_VOLUMES; ++i) {
+		for (j = 0; j < HAMMER2_NUM_VOLHDRS; ++j) {
+			off = j * HAMMER2_ZONE_BYTES64;
+			fd = hammer2_get_volume_fd(volu_loff);
+			lseek(fd, off, SEEK_SET);
+			if (read(fd, &media, HAMMER2_PBUFSIZE) ==
+			    (ssize_t)HAMMER2_PBUFSIZE) {
+				if (bests[i] < 0 || best_mirror_tid <
+				    media.voldata.mirror_tid) {
+					bests[i] = j;
+					best_mirror_tid = media.voldata.mirror_tid;
+				}
+			}
+		}
+		volu_loff = get_next_volume(&media.voldata, volu_loff);
+	}
+
 	/*
 	 * Show the tree using the best volume header.
 	 * -vvv will show the tree for all four volume headers.
 	 */
-	best_i = -1;
-	bzero(&best, sizeof(best));
-	bzero(&best_media, sizeof(best_media));
-	for (i = 0; i < HAMMER2_NUM_VOLHDRS; ++i) {
-		bzero(&broot, sizeof(broot));
-		broot.data_off = (i * HAMMER2_ZONE_BYTES64) | HAMMER2_PBUFRADIX;
-		off = broot.data_off & ~HAMMER2_OFF_MASK_RADIX;
-		fd = hammer2_get_volume_fd(volu_loff);
-		lseek(fd, off, SEEK_SET);
-		if (read(fd, &media, HAMMER2_PBUFSIZE) ==
-		    (ssize_t)HAMMER2_PBUFSIZE) {
-			broot.mirror_tid = media.voldata.mirror_tid;
-			if (best_i < 0 || best.mirror_tid < broot.mirror_tid) {
-				best_i = i;
-				best = broot;
-				best_media = media;
-			}
-			printf("Volume header %d: mirror_tid=%016jx\n",
-			       i, (intmax_t)broot.mirror_tid);
-
-			if (all_volume_headers) {
-				switch(which) {
-				case 0:
-					broot.type = HAMMER2_BREF_TYPE_VOLUME;
-					show_bref(&media.voldata, 0, i, &broot,
-						  0);
-					break;
-				case 1:
-					broot.type = HAMMER2_BREF_TYPE_FREEMAP;
-					show_bref(&media.voldata, 0, i, &broot,
-						  0);
-					break;
-				default:
-					show_volhdr(&media.voldata, i);
-					if (i == 0)
-						next_volu_loff = get_next_volume(&media.voldata, volu_loff);
-					break;
-				}
-				if (i != HAMMER2_NUM_VOLHDRS - 1)
+	for (i = 0; i < HAMMER2_MAX_VOLUMES; ++i) {
+		volu_loff = next_volu_loff;
+		printf("%s\n", hammer2_get_volume_path(volu_loff));
+		for (j = 0; j < HAMMER2_NUM_VOLHDRS; ++j) {
+			bzero(&broot, sizeof(broot));
+			broot.data_off = (j * HAMMER2_ZONE_BYTES64) |
+			    HAMMER2_PBUFRADIX;
+			off = broot.data_off & ~HAMMER2_OFF_MASK_RADIX;
+			fd = hammer2_get_volume_fd(volu_loff);
+			lseek(fd, off, SEEK_SET);
+			if (read(fd, &media, HAMMER2_PBUFSIZE) ==
+			    (ssize_t)HAMMER2_PBUFSIZE) {
+				broot.mirror_tid = media.voldata.mirror_tid;
+				printf("Volume %d header %d: mirror_tid=%016jx\n",
+				       media.voldata.volu_id, j,
+				       (intmax_t)broot.mirror_tid);
+				if (all_volume_headers || bests[i] == j) {
+					switch(which) {
+					case 0:
+						broot.type = HAMMER2_BREF_TYPE_VOLUME;
+						show_bref(&media.voldata, 0, j,
+							  &broot, 0);
+						next_volu_loff = -1;
+						break;
+					case 1:
+						broot.type = HAMMER2_BREF_TYPE_FREEMAP;
+						show_bref(&media.voldata, 0, j,
+							  &broot, 0);
+						next_volu_loff = -1;
+						break;
+					default:
+						show_volhdr(&media.voldata, j);
+						next_volu_loff = get_next_volume(
+						    &media.voldata, volu_loff);
+						break;
+					}
+				if (all_volume_headers && j != HAMMER2_NUM_VOLHDRS - 1)
 					printf("\n");
+				}
 			}
 		}
-	}
-	if (next_volu_loff != (hammer2_off_t)-1) {
-		printf("---------------------------------------------\n");
-		goto next_volume;
-	}
-
-	if (!all_volume_headers) {
-		switch(which) {
-		case 0:
-			best.type = HAMMER2_BREF_TYPE_VOLUME;
-			show_bref(&best_media.voldata, 0, best_i, &best, 0);
+		if (next_volu_loff == (hammer2_off_t)-1)
 			break;
-		case 1:
-			best.type = HAMMER2_BREF_TYPE_FREEMAP;
-			show_bref(&best_media.voldata, 0, best_i, &best, 0);
-			break;
-		default:
-			show_volhdr(&best_media.voldata, best_i);
-			next_volu_loff = get_next_volume(&best_media.voldata, volu_loff);
-			if (next_volu_loff != (hammer2_off_t)-1) {
-				printf("---------------------------------------------\n");
-				goto next_volume;
-			}
-			break;
-		}
+		if (i != HAMMER2_MAX_VOLUMES - 1)
+			printf("---------------------------------------------\n");
 	}
 
 	if (which == 1 && VerboseOpt < 3) {
@@ -552,6 +757,8 @@ next_volume:
 		printf("Total freemap storage:       %6.3fGiB\n",
 		       (double)TotalFreemap / GIG);
 	}
+
+done:
 	hammer2_cleanup_volumes();
 
 	return 0;
@@ -566,7 +773,7 @@ show_volhdr(hammer2_volume_data_t *voldata, int bi)
 	char *buf;
 	hammer2_uuid_t uuid;
 
-	printf("\nVolume header %d {\n", bi);
+	printf("\nVolume %d header %d {\n", voldata->volu_id, bi);
 	printf("    magic          0x%016jx\n", (intmax_t)voldata->magic);
 	printf("    boot_beg       0x%016jx\n", (intmax_t)voldata->boot_beg);
 	printf("    boot_end       0x%016jx (%6.2fMB)\n",

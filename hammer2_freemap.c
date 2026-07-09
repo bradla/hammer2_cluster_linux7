@@ -303,7 +303,7 @@ hammer2_freemap_try_alloc(hammer2_chain_t **parentp, hammer2_blockref_t *bref,
 		error = HAMMER2_ERROR_ENOSPC;
 	} else {
 		/* Modify existing chain to setup for adjustment. */
-		hammer2_chain_modify(chain, mtid, 0, 0);
+		error = hammer2_chain_modify(chain, mtid, 0, 0);
 	}
 
 	/* Scan 4MB entries. */
@@ -312,10 +312,17 @@ hammer2_freemap_try_alloc(hammer2_chain_t **parentp, hammer2_blockref_t *bref,
 		start = (int)((iter->bnext - key) >>
 		    HAMMER2_FREEMAP_LEVEL0_RADIX);
 		KKASSERT(start >= 0 && start < HAMMER2_FREEMAP_COUNT);
-		hammer2_chain_modify(chain, mtid, 0, 0);
-
-		error = HAMMER2_ERROR_ENOSPC;
-		for (count = 0; count < HAMMER2_FREEMAP_COUNT; ++count) {
+		/*
+		 * COW the freemap leaf for adjustment.  If the modify fails do
+		 * NOT scan/mutate the bitmap -- that would write allocation bits
+		 * into a chain that was not successfully instantiated and then
+		 * falsely report the allocation as successful.
+		 */
+		error = hammer2_chain_modify(chain, mtid, 0, 0);
+		if (error == 0)
+			error = HAMMER2_ERROR_ENOSPC;
+		for (count = 0; error == HAMMER2_ERROR_ENOSPC &&
+		    count < HAMMER2_FREEMAP_COUNT; ++count) {
 			if (start + count >= HAMMER2_FREEMAP_COUNT &&
 			    start - count < 0)
 				break;

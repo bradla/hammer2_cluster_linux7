@@ -125,7 +125,21 @@ dmsg_iocom_init(dmsg_iocom_t *iocom, int sock_fd, int alt_fd,
 	iocom->altmsg_callback = altmsg_func;
 	iocom->usrmsg_callback = usrmsg_func;
 
-	pthread_mutex_init(&iocom->mtx, NULL);
+	/*
+	 * Linux port: iocom->mtx must be RECURSIVE.  libdmsg re-locks it from
+	 * the same thread (e.g. dmsg_state_cleanuprx() is called with the mtx
+	 * held, and it calls dmsg_msg_free() which locks the mtx again).  On
+	 * DragonFly the default (NULL-attr) mutex tolerates same-thread
+	 * recursion; glibc's default NORMAL mutex hard-deadlocks.  Make it
+	 * PTHREAD_MUTEX_RECURSIVE to match the assumed BSD semantics.
+	 */
+	{
+		pthread_mutexattr_t _mattr;
+		pthread_mutexattr_init(&_mattr);
+		pthread_mutexattr_settype(&_mattr, PTHREAD_MUTEX_RECURSIVE);
+		pthread_mutex_init(&iocom->mtx, &_mattr);
+		pthread_mutexattr_destroy(&_mattr);
+	}
 	RB_INIT(&iocom->staterd_tree);
 	RB_INIT(&iocom->statewr_tree);
 	TAILQ_INIT(&iocom->txmsgq);

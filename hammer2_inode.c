@@ -956,7 +956,15 @@ hammer2_inode_create_normal(hammer2_inode_t *pip, struct vattr *vap,
 	nip->meta.atime = nip->meta.ctime;
 	nip->meta.btime = nip->meta.ctime;
 	nip->meta.mode = vap->va_mode;
-	nip->meta.nlinks = nip->meta.type == HAMMER2_OBJTYPE_DIRECTORY ? 2 : 1;
+	/*
+	 * On-disk parity with DragonFly: HAMMER2 stores nlinks == 1 for
+	 * directories (it does not maintain the traditional 2+subdirs count).
+	 * The Linux VFS mkdir/rmdir/rename paths guard their parent-nlink
+	 * maintenance with `meta.nlinks != 1`, so keeping this at 1 disables
+	 * that bookkeeping and keeps images interoperable with native DragonFly
+	 * tooling (a dir written here rmdir'd on DragonFly frees correctly).
+	 */
+	nip->meta.nlinks = 1;
 	if ((nip->meta.mode & S_ISGID) &&
 	    !groupmember(hammer2_inode_to_gid(nip), cred))
 		if (priv_check_cred(cred, PRIV_VFS_RETAINSUGID))

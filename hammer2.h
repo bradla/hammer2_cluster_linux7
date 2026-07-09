@@ -378,6 +378,8 @@ void hammer2_print_iostat(const struct hammer2_iostat *ios, const char *msg);
 /* hammer2_assert_inode_meta is defined as a static inline below. */
 int  hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor);
 int  hammer2_sync(struct mount *mp, int waitfor);
+void hammer2_pfs_memory_wait(hammer2_pfs_t *pmp);
+extern long hammer2_limit_dirty_chains;
 
 /* Lifted from hammer2_bulkfree.c so other TUs can name the type. */
 typedef struct hammer2_chain_save {

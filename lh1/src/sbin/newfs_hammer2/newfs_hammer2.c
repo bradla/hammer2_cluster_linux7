@@ -41,10 +41,12 @@
 #include <unistd.h>
 #include <string.h>
 #include <err.h>
+#include <assert.h>
 
 #include "mkfs_hammer2.h"
 
 static void usage(void);
+static void parse_fs_size(hammer2_mkfs_options_t *, const char *);
 
 int
 main(int ac, char **av)
@@ -61,7 +63,9 @@ main(int ac, char **av)
 	/*
 	 * Parse arguments.
 	 */
-	while ((ch = getopt(ac, av, "L:b:r:V:d")) != -1) {
+	while ((ch = getopt(ac, av, "L:b:r:V:s:d")) != -1) {
+		int i;
+
 		switch(ch) {
 		case 'b':
 			opt.BootAreaSize = getsize(optarg,
@@ -87,6 +91,13 @@ main(int ac, char **av)
 			if (strcasecmp(optarg, "none") == 0) {
 				break;
 			}
+			for (i = 0; i < opt.NLabels; i++) {
+				if (strcasecmp(opt.Label[i], optarg) == 0) {
+					errx(1, "duplicate label \"%s\"; "
+					    "note \"LOCAL\" is auto-created",
+					    optarg);
+				}
+			}
 			if (opt.NLabels >= MAXLABELS) {
 				errx(1, "Limit of %d local labels",
 				     MAXLABELS - 1);
@@ -102,6 +113,9 @@ main(int ac, char **av)
 					HAMMER2_INODE_MAXNAME - 1);
 			}
 			opt.Label[opt.NLabels++] = strdup(optarg);
+			break;
+		case 's':
+			parse_fs_size(&opt, optarg);
 			break;
 		case 'd':
 			opt.DebugOpt = 1;
@@ -149,11 +163,33 @@ main(int ac, char **av)
 
 static
 void
+parse_fs_size(hammer2_mkfs_options_t *opt, const char *arg)
+{
+	char *o, *p, *s;
+
+	opt->NFileSystemSizes = 0;
+	o = p = strdup(arg);
+
+	while ((s = p) != NULL) {
+		if ((p = strchr(p, ':')) != NULL)
+			*p++ = 0;
+		/* XXX 0x7fffffffffffffff isn't limitation of HAMMER2 */
+		opt->FileSystemSize[opt->NFileSystemSizes++] = getsize(s,
+				 HAMMER2_FREEMAP_LEVEL1_SIZE,
+				 0x7fffffffffffffff, 2);
+		if (opt->NFileSystemSizes >= HAMMER2_MAX_VOLUMES)
+			break;
+	}
+	free(o);
+}
+
+static
+void
 usage(void)
 {
 	fprintf(stderr,
 		"usage: newfs_hammer2 [-b bootsize] [-r auxsize] "
-		"[-V version] [-L label ...] special ...\n"
+		"[-V version] [-L label ...] [-s size] special ...\n"
 	);
 	exit(1);
 }

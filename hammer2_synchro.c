@@ -55,6 +55,9 @@
  * declared extern in hammer2.h.
  */
 int hammer2_debug = 0;
+module_param(hammer2_debug, int, 0644);
+MODULE_PARM_DESC(hammer2_debug,
+	"HAMMER2 debug mask (bit 0x0100 = RXSPAN trace of received LNK_SPANs)");
 
 typedef struct hammer2_deferred_ip {
 	struct hammer2_deferred_ip *next;

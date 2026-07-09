@@ -1258,13 +1258,20 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch, int clindex)
 	if (fsync_error == 0 && flush_error == 0 &&
 	    (hmp->vchain.flags & HAMMER2_CHAIN_VOLUMESYNC)) {
 		/*
-		 * Port note: BSD uses g_alloc_bio/g_io_request to issue a
-		 * BIO_FLUSH down to GEOM.  Linux equivalent:
-		 *   blkdev_issue_flush(hmp->devvp_blkdev)
-		 * Plumbed when the mount path wires up the block_device.
+		 * Cache-flush barrier (the commit-point ordering guarantee):
+		 * drain the device's volatile write cache so every flushed
+		 * data/metadata block is on stable storage BEFORE the rotating
+		 * volume header (the commit point) is written.  Without this a
+		 * power loss on a write-caching drive could land the new volume
+		 * header ahead of the blocks it references, leaving an
+		 * inconsistent tree.  DragonFly issues BIO_FLUSH via GEOM here;
+		 * the Linux equivalent is blkdev_issue_flush().  sync_blockdev()
+		 * above only writes back the page cache, not the device cache.
 		 */
 		(void)cp;
 		(void)bio;
+		if (hmp->devvp)
+			blkdev_issue_flush(hmp->devvp);
 
 		/*
 		 * Then we can safely flush the version of the
@@ -1297,8 +1304,16 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch, int clindex)
 			if (werr)
 				hprintf("volume header %d write failed: %d\n",
 				    j, werr);
-			else
+			else {
 				sync_blockdev(hmp->devvp);
+				/*
+				 * Second barrier: make the volume-header write
+				 * (the commit itself) durable on the platter
+				 * before returning, so a crash right after this
+				 * flush cannot lose the commit.
+				 */
+				blkdev_issue_flush(hmp->devvp);
+			}
 		}
 		atomic_clear_int(&hmp->vchain.flags, HAMMER2_CHAIN_VOLUMESYNC);
 		hmp->volhdrno = j;

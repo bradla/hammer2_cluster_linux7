@@ -213,13 +213,13 @@ dmsg_msg_dbg(dmsg_msg_t *msg)
 		break;
 	case DMSG_DBG_SHELL | DMSGF_REPLY:
 		/*
-		 * A reply just prints out the string.  No newline is added
-		 * (it is expected to be embedded if desired).
+		 * A reply.  Route it to the application callback so the app
+		 * decides what to do (the interactive shell prints it to
+		 * stdout; a file-pull writes the raw aux_data to disk).  Do
+		 * NOT null-terminate here -- that corrupts binary payloads;
+		 * the callback uses aux_size if it needs the exact bytes.
 		 */
-		if (msg->aux_data)
-			msg->aux_data[msg->aux_size - 1] = 0;
-		if (msg->aux_data)
-			write(2, msg->aux_data, strlen(msg->aux_data));
+		iocom->usrmsg_callback(msg, 0);
 		break;
 	default:
 		iocom->usrmsg_callback(msg, 1);

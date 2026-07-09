@@ -192,6 +192,18 @@ main(int ac, char **av)
 			usage(1);
 		}
 		ecode = cmd_debugspan(av[1]);
+	} else if (strcmp(av[0], "pullfile") == 0) {
+		/*
+		 * Mock master/slave sync: pull a file from a remote node's
+		 * hammer2 service over DMSG and write it locally.
+		 */
+		if (ac < 4) {
+			fprintf(stderr,
+			    "pullfile: usage: pullfile <host> <remotepath> "
+			    "<localpath>\n");
+			usage(1);
+		}
+		ecode = cmd_pullfile(av[1], av[2], av[3]);
 	} else if (strcmp(av[0], "disconnect") == 0) {
 		/*
 		 * Remove cluster connection
@@ -292,6 +304,22 @@ main(int ac, char **av)
 			usage(1);
 		}
 		ecode = cmd_pfs_delete(sel_path, av, ac);
+	} else if (strcmp(av[0], "recover") == 0 ||
+		   strcmp(av[0], "recover-relaxed") == 0 ||
+		   strcmp(av[0], "recover-file") == 0) {
+		/*
+		 * Recover a relative path (unanchored match), absolute path,
+		 * specific file, or directory sub-tree.  File restorals are
+		 * fully validated.
+		 */
+		if (ac != 4) {
+			fprintf(stderr, "recover device [/]path destdir\n");
+			usage(1);
+		} else {
+			int strict = (strcmp(av[0], "recover-relaxed") != 0);
+			int isafile = (strcmp(av[0], "recover-file") == 0);
+			ecode = cmd_recover(av[1], av[2], av[3], strict, isafile);
+		}
 	} else if (strcmp(av[0], "snapshot") == 0 ||
 		   strcmp(av[0], "snapshot-debug") == 0) {
 		/*
@@ -410,11 +438,16 @@ main(int ac, char **av)
 		 * Raw dump of filesystem.  Use -v to check all crc's, and
 		 * -vv to dump bulk file data.
 		 */
-		if (ac != 2) {
+		switch(ac) {
+		case 2:
+			cmd_show(av[1], NULL, 0);
+			break;
+		case 3:
+			cmd_show(av[1], av[2], 0);
+			break;
+		default:
 			fprintf(stderr, "show: requires device path\n");
 			usage(1);
-		} else {
-			cmd_show(av[1], 0);
 		}
 	} else if (strcmp(av[0], "freemap") == 0) {
 		/*
@@ -425,7 +458,7 @@ main(int ac, char **av)
 			fprintf(stderr, "freemap: requires device path\n");
 			usage(1);
 		} else {
-			cmd_show(av[1], 1);
+			cmd_show(av[1], NULL, 1);
 		}
 	} else if (strcmp(av[0], "volhdr") == 0) {
 		/*
@@ -435,7 +468,7 @@ main(int ac, char **av)
 			fprintf(stderr, "volhdr: requires device path\n");
 			usage(1);
 		} else {
-			cmd_show(av[1], 2);
+			cmd_show(av[1], NULL, 2);
 		}
 	} else if (strcmp(av[0], "volume-list") == 0) {
 		/*
@@ -595,10 +628,18 @@ usage(int code)
 			"Connect to target, run CONN/SPAN\n"
 		"    growfs [<path...]                 "
 			"Grow a filesystem into resized partition\n"
+		"    recover <devpath> <path> <destdir> "
+			"Recover files from corrupted media\n"
+		"    recover-relaxed <devpath> <path> <destdir> "
+			"Recover files (relaxed validation)\n"
+		"    recover-file <devpath> <path> <destdir> "
+			"Recover a single file\n"
 		"    rsainit [<path>]                  "
 			"Initialize rsa fields\n"
-		"    show <devpath>                    "
-			"Raw hammer2 media dump for topology\n"
+		"    show <devpath> [chainspec]        "
+			"Raw hammer2 media dump for topology,\n"
+		"                                      "
+			"or specific block w/chainspec %%jx.%%02x\n"
 		"    freemap <devpath>                 "
 			"Raw hammer2 media dump for freemap\n"
 		"    volhdr <devpath>                  "

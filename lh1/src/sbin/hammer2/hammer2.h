@@ -163,13 +163,17 @@ int cmd_stat(int ac, const char **av);
 int cmd_leaf(const char *sel_path);
 int cmd_shell(const char *hostname);
 int cmd_debugspan(const char *hostname);
+int cmd_pullfile(const char *hostname, const char *remotepath,
+		 const char *localpath);
 int cmd_destroy_path(int ac, const char **av);
 int cmd_destroy_inum(const char *sel_path, int ac, const char **av);
 int cmd_dumpchain(const char *path, u_int flags);
 int cmd_emergency_mode(const char *sel_path, int enable,
 			int ac, const char **av);
 int cmd_growfs(const char *sel_path, int ac, const char **av);
-int cmd_show(const char *devpath, int which);
+int cmd_recover(const char *devpath, const char *filename,
+			const char *destdir, int strict, int isafile);
+int cmd_show(const char *devpath, const char *chspec, int which);
 int cmd_volume_list(int ac, char **av);
 int cmd_rsainit(const char *dir_path);
 int cmd_rsaenc(const char **keys, int nkeys);

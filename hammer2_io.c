@@ -247,8 +247,16 @@ hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
 	hammer2_mtx_ex(&hmp->iohash_lock);
 	if (op == HAMMER2_DOP_READQ) {
 		dio = hammer2_io_alloc(hmp, lbase, btype, 0);
-		if (dio == NULL)
+		if (dio == NULL) {
+			/*
+			 * Dedup probe miss (block not currently cached).  Must
+			 * drop iohash_lock before returning -- every other exit
+			 * unlocks below; leaking it here wedges the whole FS the
+			 * moment any other thread needs iohash_lock.
+			 */
+			hammer2_mtx_unlock(&hmp->iohash_lock);
 			return (NULL);
+		}
 		op = HAMMER2_DOP_READ;
 	} else {
 		dio = hammer2_io_alloc(hmp, lbase, btype, 1);
@@ -364,7 +372,15 @@ hammer2_io_putblk(hammer2_io_t **diop)
 	orefs = dio->refs;
 	if ((dio->refs & HAMMER2_DIO_MASK) == 1) {
 		dio->refs--;
-		dio->refs &= ~(HAMMER2_DIO_GOOD | HAMMER2_DIO_DIRTY);
+		/*
+		 * Clear the transient state bits on the 1->0 transition.  dios
+		 * are cached and reused, so leaving a stale FLUSH bit set would
+		 * force the next delayed write (bdwrite) on the reused dio into
+		 * a synchronous write and defeat write batching.  The writeback
+		 * below keys off the captured `orefs`, not the live refs.
+		 */
+		dio->refs &= ~(HAMMER2_DIO_GOOD | HAMMER2_DIO_DIRTY |
+			       HAMMER2_DIO_FLUSH);
 	} else {
 		dio->refs--;
 		hammer2_mtx_unlock(&dio->lock);
@@ -389,7 +405,7 @@ hammer2_io_putblk(hammer2_io_t **diop)
 		if (orefs & HAMMER2_DIO_DIRTY) {
 			hammer2_dev_bwrite(dio->bdev, dio->pbase - dio->dbase,
 			    dio->data, dio->psize,
-			    (dio->refs & HAMMER2_DIO_FLUSH) ? 1 : 0);
+			    (orefs & HAMMER2_DIO_FLUSH) ? 1 : 0);
 			hammer2_inc_iostat(&hmp->iostat_write, dio->btype,
 			    dio->psize);
 		}

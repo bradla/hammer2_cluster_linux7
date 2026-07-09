@@ -81,6 +81,7 @@ int hammer2_count_inode_allocated;
 int hammer2_count_chain_allocated;
 int hammer2_count_chain_modified;
 int hammer2_count_dio_allocated;
+long hammer2_limit_dirty_chains;	/* dirty-chain throttle limit */
 int hammer2_dio_limit = 256;
 int hammer2_bulkfree_tps = 5000;
 int hammer2_limit_scan_depth;
@@ -167,8 +168,6 @@ hammer2_assert_clean(void)
 int
 hammer2_init(struct vfsconf *vfsp)
 {
-	long hammer2_limit_dirty_chains; /* originally sysctl */
-
 	hammer2_assert_clean();
 
 	hammer2_dio_limit = nbuf * 2;
@@ -1675,6 +1674,26 @@ int
 hammer2_sync(struct mount *mp, int waitfor)
 {
 	return (hammer2_vfs_sync_pmp(MPTOPMP(mp), waitfor));
+}
+
+/*
+ * Dirty-chain write throttle (equivalent of DragonFly's .vfs_modifying ->
+ * hammer2_pfs_memory_wait backpressure).  DragonFly stalls the frontend on a
+ * dedicated syncer thread when modified chains exceed hammer2_limit_dirty_
+ * chains; this port has no such background syncer, so instead of sleeping
+ * (which could hang with nothing to drain the backlog) the crossing writer
+ * flushes this filesystem inline to drain it, then proceeds.  Net effect is
+ * the same: a heavy writer is throttled (it pays the flush cost) and dirty
+ * chains cannot accumulate without bound.  Must be called BEFORE the caller
+ * takes any HAMMER2 inode lock (i.e. at the top of the modifying VFS op).
+ */
+void
+hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
+{
+	if (pmp == NULL || pmp->mp == NULL)
+		return;
+	if (hammer2_count_chain_modified >= hammer2_limit_dirty_chains)
+		hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
 }
 
 int
