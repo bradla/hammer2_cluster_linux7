@@ -130,6 +130,21 @@ hammer2_decompress_ZLIB_callback(const char *data, unsigned int bytes,
 	strm_decompress.avail_in = 0;
 	strm_decompress.next_in = Z_NULL;
 
+	/*
+	 * Linux kernel zlib requires a CALLER-ALLOCATED workspace;
+	 * zlib_inflateInit() returns Z_STREAM_ERROR (and zlib_inflate()
+	 * crashes) without one.  This is the one real difference from the
+	 * userland/BSD zlib API the DragonFly code was written against.
+	 */
+	strm_decompress.workspace =
+	    kvmalloc(zlib_inflate_workspacesize(), GFP_KERNEL);
+	if (strm_decompress.workspace == NULL) {
+		hprintf("no memory for zlib inflate workspace\n");
+		bzero(bp->b_data, bp->b_bufsize);
+		bp->b_resid = 0;
+		return;
+	}
+
 	result = inflateInit(&strm_decompress);
 	if (result != Z_OK)
 		hprintf("fatal error in inflateInit\n");
@@ -153,6 +168,7 @@ hammer2_decompress_ZLIB_callback(const char *data, unsigned int bytes,
 		bzero(bp->b_data + result, strm_decompress.avail_out);
 	uma_zfree(hammer2_zone_rbuf, compressed_buffer);
 	inflateEnd(&strm_decompress);
+	kvfree(strm_decompress.workspace);
 
 	bp->b_resid = 0;
 }
@@ -651,6 +667,17 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 			else if (comp_level > 9)
 				comp_level = 9;
 			bzero(&strm_compress, sizeof(strm_compress));
+			/* Linux kernel zlib needs a caller-supplied workspace
+			 * (see the inflate side); without it deflateInit
+			 * fails and deflate() crashes.  On allocation failure
+			 * fall back to storing the block uncompressed. */
+			strm_compress.workspace = kvmalloc(
+			    zlib_deflate_workspacesize(MAX_WBITS,
+			    MAX_MEM_LEVEL), GFP_KERNEL);
+			if (strm_compress.workspace == NULL) {
+				comp_size = 0;
+				break;
+			}
 			ret = deflateInit(&strm_compress, comp_level);
 			if (ret != Z_OK)
 				hprintf("fatal error on deflateInit\n");
@@ -667,6 +694,7 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 			else
 				comp_size = 0;
 			ret = deflateEnd(&strm_compress);
+			kvfree(strm_compress.workspace);
 			break;
 		default:
 			hprintf("unknown compression method %d\n", comp_algo);
