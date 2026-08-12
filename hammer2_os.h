@@ -257,17 +257,58 @@ hammer2_mtx_temp_restore(hammer2_mtx_t *p, int x)
 static inline int
 hammer2_lkc_sleep(hammer2_lkc_t *c, hammer2_lk_t *lk, const char *s, int timo)
 {
-	int ret = 0;
+	DEFINE_WAIT(__w);
+	long rem = 1;
 
+	(void)s;
+
+	/*
+	 * BSD tsleep()/wakeup() semantics: sleep until somebody calls
+	 * hammer2_lkc_wakeup(c) (or until `timo` expires), then RETURN so that
+	 * the caller can re-test its own condition.  Every call site in this
+	 * tree is of the shape
+	 *
+	 *	again:
+	 *		if (busy) {
+	 *			set_flag();
+	 *			hammer2_lkc_sleep(cv, mtx, "...", 0);
+	 *			goto again;
+	 *		}
+	 *
+	 * i.e. the predicate is re-evaluated by the *caller*, not in here.
+	 *
+	 * The previous implementation used wait_event(*c, 0) for timo == 0.
+	 * wait_event() is a predicate loop -- it only leaves the loop when the
+	 * condition evaluates true, and the condition here is the constant 0,
+	 * so it could never return: each hammer2_lkc_wakeup() woke the task,
+	 * the task re-evaluated 0, and went straight back to sleep.  Because
+	 * it slept in TASK_UNINTERRUPTIBLE it also ignored SIGKILL, and
+	 * because it context-switched on every wakeup the hung-task detector's
+	 * switch-count heuristic never flagged it either.
+	 *
+	 * All three call sites (hammer2_admin.c xop_testset_ipdep,
+	 * hammer2_chain.c chain load IOINPROG, hammer2_flush.c trans_init)
+	 * pass timo == 0, so every one of them was affected.  They are only
+	 * reached under genuine contention -- two threads racing on the same
+	 * chain/inode -- which is why the failure was intermittent rather than
+	 * immediate.  Caught as an unkillable D-state hang in execve():
+	 *   hammer2_xop_testset_ipdep -> hammer2_lkc_sleep -> schedule (forever)
+	 *
+	 * Ordering note: the task is queued on the waitqueue BEFORE the lock is
+	 * dropped.  Doing it the other way round opens a lost-wakeup window in
+	 * which the waker runs between up_write() and prepare_to_wait() and the
+	 * wakeup is missed entirely.
+	 */
+	prepare_to_wait(c, &__w, TASK_UNINTERRUPTIBLE);
 	up_write(lk);
-	if (timo == 0) {
-		wait_event(*c, 0);
-	} else {
-		ret = wait_event_timeout(*c, 0, msecs_to_jiffies(timo));
-		ret = (ret == 0) ? -ETIMEDOUT : 0;
-	}
+	if (timo == 0)
+		schedule();
+	else
+		rem = schedule_timeout(msecs_to_jiffies(timo));
+	finish_wait(c, &__w);
 	down_write(lk);
-	return ret;
+
+	return (timo && rem == 0) ? -ETIMEDOUT : 0;
 }
 
 static inline void

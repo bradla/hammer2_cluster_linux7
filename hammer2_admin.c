@@ -276,10 +276,35 @@ hammer2_xop_unset_ipdep(hammer2_inode_t *ip)
 
 	hammer2_lk_ex(mtx);
 	xop_unset_ipdep(ip, ip->ipdep_idx);
-	if (pmp->flags & HAMMER2_PMPF_WAITING) {
-		pmp->flags &= ~HAMMER2_PMPF_WAITING;
-		hammer2_lkc_wakeup(cv);
-	}
+
+	/*
+	 * Wake the per-index condition variable UNCONDITIONALLY.
+	 *
+	 * Upstream gates this on HAMMER2_PMPF_WAITING, which loses wakeups:
+	 * pmp->flags is a single PFS-wide flag, but xop_lock[]/xop_cv[] are
+	 * arrays indexed by ip->ipdep_idx.  So:
+	 *
+	 *   1. thread A sleeps on cv[0]  -> sets PMPF_WAITING
+	 *   2. thread B sleeps on cv[1]  -> sets PMPF_WAITING (already set)
+	 *   3. unset_ipdep for idx 1     -> sees the flag, CLEARS it, wakes cv[1]
+	 *   4. unset_ipdep for idx 0     -> flag is clear, so cv[0] is NEVER woken
+	 *
+	 * Thread A then sleeps forever in TASK_UNINTERRUPTIBLE, holding whatever
+	 * it holds, and everything behind it piles up on page locks.  Worse, the
+	 * flag is read/modified under mtx = xop_lock[ipdep_idx] -- a DIFFERENT
+	 * lock per index -- so the accesses are not even mutually excluded.
+	 *
+	 * Observed on Linux booting a real systemd userland: ~26 tasks stuck in D
+	 * state, one in hammer2_xop_testset_ipdep and the rest blocked behind it
+	 * in folio_wait_bit_common; every systemd unit then timed out at 90s.
+	 *
+	 * wake_up() on an empty wait queue is cheap, so simply always waking is
+	 * both correct and negligible.  The flag is still cleared, purely so the
+	 * KKASSERT in hammer2_vfsops.c (unmount) keeps holding.
+	 */
+	pmp->flags &= ~HAMMER2_PMPF_WAITING;
+	hammer2_lkc_wakeup(cv);
+
 	hammer2_lk_unlock(mtx);
 }
 

@@ -45,7 +45,7 @@
  * automatically so two builds of the same version number are still
  * distinguishable.
  */
-#define HAMMER2_PORT_VERSION	"0.42"
+#define HAMMER2_PORT_VERSION	"0.43"
 #define HAMMER2_PORT_BUILD	HAMMER2_PORT_VERSION " built " __DATE__ " " __TIME__
 
 /* BSD-shaped vfsops entry points (un-static'd in hammer2_vfsops.c). */
