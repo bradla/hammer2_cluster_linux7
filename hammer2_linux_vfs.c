@@ -28,6 +28,9 @@
 #include <linux/fs.h>
 #include <linux/fs_context.h>
 #include <linux/pagemap.h>
+#include <linux/highmem.h>
+#include <linux/writeback.h>
+#include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/statfs.h>
 #include <linux/uio.h>
@@ -42,7 +45,7 @@
  * automatically so two builds of the same version number are still
  * distinguishable.
  */
-#define HAMMER2_PORT_VERSION	"0.38"
+#define HAMMER2_PORT_VERSION	"0.42"
 #define HAMMER2_PORT_BUILD	HAMMER2_PORT_VERSION " built " __DATE__ " " __TIME__
 
 /* BSD-shaped vfsops entry points (un-static'd in hammer2_vfsops.c). */
@@ -63,6 +66,7 @@ static const struct inode_operations hammer2_symlink_iops;
 static const struct inode_operations hammer2_special_iops;
 static const struct file_operations hammer2_dir_fops;
 static const struct file_operations hammer2_file_fops;
+static const struct address_space_operations hammer2_aops;
 
 /* ------------------------------------------------------------------------ */
 /* Type and attribute translation helpers				    */
@@ -104,6 +108,19 @@ hammer2_set_inode_ops(struct inode *inode)
 	case S_IFREG:
 		inode->i_op = &hammer2_file_iops;
 		inode->i_fop = &hammer2_file_fops;
+		inode->i_mapping->a_ops = &hammer2_aops;
+		/*
+		 * Let the page cache build folios up to one HAMMER2 logical
+		 * block (64KiB) but no larger.  Matching the fs block size
+		 * lets a full-block overwrite skip the read-modify-write and
+		 * collapses fill/writeback from 16x4KiB folios per block down
+		 * to one, killing the write amplification that made large
+		 * writes (write_100k/writev) slow.  min order 0 keeps a 4KiB
+		 * fallback under memory pressure.  No-op unless THP is built
+		 * in (it is on this kernel).
+		 */
+		mapping_set_folio_order_range(inode->i_mapping, 0,
+		    HAMMER2_PBUFRADIX - PAGE_SHIFT);
 		break;
 	case S_IFDIR:
 		inode->i_op = &hammer2_dir_iops;
@@ -238,7 +255,7 @@ hammer2_strategy_block(struct inode *inode, hammer2_key_t lbase, char *data,
 /* Read path								    */
 /* ------------------------------------------------------------------------ */
 
-static ssize_t
+static ssize_t __maybe_unused
 hammer2_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
@@ -587,127 +604,284 @@ hammer2_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 /* Write path								    */
 /* ------------------------------------------------------------------------ */
 
-static ssize_t
-hammer2_write_iter(struct kiocb *iocb, struct iov_iter *from)
+/*
+ * ----------------------------------------------------------------------
+ * Page-cache address_space operations
+ * ----------------------------------------------------------------------
+ *
+ * The file data path is routed through the Linux page cache so that
+ * read(2), write(2) and mmap(2) all observe a single coherent view of a
+ * file.  read_folio()/writepages() bridge the 4KiB folio world to
+ * HAMMER2's native 64KiB (HAMMER2_PBUFSIZE) logical block via the same
+ * hammer2_strategy_block() primitive the old block path used.  Because a
+ * folio is smaller than a logical block, writeback read-modify-writes the
+ * containing block so bytes belonging to sibling folios are preserved.
+ */
+
+/*
+ * Populate a folio from on-media data, zero-filling any region at or past
+ * EOF.  Shared by read_folio() and write_begin() (partial-write RMW).
+ */
+static int
+hammer2_fill_folio(struct inode *inode, struct folio *folio)
 {
-	struct inode *inode = file_inode(iocb->ki_filp);
 	hammer2_inode_t *ip = VTOI(inode);
-	hammer2_pfs_t *pmp = ip->pmp;
-	loff_t pos, newend;
-	size_t want;
-	ssize_t total = 0;
-	char *blk, *preserve = NULL;
-	uint64_t mtime;
+	loff_t fpos = folio_pos(folio);
+	size_t fsize = folio_size(folio);
+	loff_t isize;
+	char *blk;
+	size_t done = 0;
 	int error = 0;
 
-	if (pmp->rdonly || (pmp->flags & HAMMER2_PMPF_EMERG))
-		return -EROFS;
-
-	/*
-	 * Dirty-chain write throttle (DragonFly .vfs_modifying equivalent).
-	 * Drains the modified-chain backlog inline if it has grown past the
-	 * limit, providing backpressure so heavy sustained writes cannot
-	 * accumulate dirty chains without bound.  Called before inode_lock so
-	 * the inline flush cannot deadlock against our own inode lock.
-	 */
-	hammer2_pfs_memory_wait(pmp);
-
-	inode_lock(inode);
-
-	pos = iocb->ki_pos;
-	if (iocb->ki_flags & IOCB_APPEND)
-		pos = i_size_read(inode);
-	want = iov_iter_count(from);
-	if (want == 0)
-		goto out_unlock;
+	hammer2_mtx_sh(&ip->lock);
+	isize = ip->meta.size;
+	hammer2_mtx_unlock(&ip->lock);
 
 	blk = kmalloc(HAMMER2_PBUFSIZE, GFP_KERNEL);
-	if (!blk) {
-		error = -ENOMEM;
-		goto out_unlock;
-	}
+	if (!blk)
+		return -ENOMEM;
 
-	newend = pos + want;
-
-	/*
-	 * Preserve embedded inode data when the write grows the file across
-	 * the embedded-data boundary: the bytes living inside the inode must
-	 * be migrated into the first real data block (mirrors the bread +
-	 * bdwrite dance in the BSD hammer2_extend_file()).
-	 */
-	if ((loff_t)ip->meta.size > 0 &&
-	    (loff_t)ip->meta.size <= HAMMER2_EMBEDDED_BYTES &&
-	    newend > HAMMER2_EMBEDDED_BYTES) {
-		preserve = kmalloc(HAMMER2_PBUFSIZE, GFP_KERNEL);
-		if (preserve &&
-		    hammer2_strategy_block(inode, 0, preserve, BIO_READ) != 0) {
-			kfree(preserve);
-			preserve = NULL;
-		}
-	}
-
-	if (newend > (loff_t)ip->meta.size)
-		hammer2_resize_meta(inode, ip, newend);
-
-	if (preserve) {
-		hammer2_trans_init(pmp, HAMMER2_TRANS_BUFCACHE);
-		hammer2_strategy_block(inode, 0, preserve, BIO_WRITE);
-		hammer2_trans_done(pmp, HAMMER2_TRANS_BUFCACHE);
-		kfree(preserve);
-		preserve = NULL;
-	}
-
-	while (want > 0) {
+	while (done < fsize) {
+		loff_t pos = fpos + done;
 		hammer2_key_t lbase = pos & ~(hammer2_key_t)HAMMER2_PBUFMASK;
 		int loff = (int)(pos - lbase);
-		size_t n = HAMMER2_PBUFSIZE - loff;
+		size_t chunk = HAMMER2_PBUFSIZE - loff;
+		size_t valid;
 
-		if (n > want)
-			n = want;
+		if (chunk > fsize - done)
+			chunk = fsize - done;
 
-		/* Read-modify-write for partial blocks. */
-		if (loff != 0 || n != HAMMER2_PBUFSIZE) {
+		if (pos >= isize) {
+			folio_zero_range(folio, done, fsize - done);
+			break;
+		}
+
+		error = hammer2_strategy_block(inode, lbase, blk, BIO_READ);
+		if (error)
+			goto out;
+
+		valid = chunk;
+		if ((loff_t)(pos + chunk) > isize)
+			valid = (size_t)(isize - pos);
+		memcpy_to_folio(folio, done, blk + loff, valid);
+		if (valid < chunk)
+			folio_zero_range(folio, done + valid, chunk - valid);
+		done += chunk;
+	}
+out:
+	kfree(blk);
+	return error;
+}
+
+static int
+hammer2_read_folio(struct file *file, struct folio *folio)
+{
+	int error = hammer2_fill_folio(folio->mapping->host, folio);
+
+	if (!error)
+		folio_mark_uptodate(folio);
+	folio_unlock(folio);
+	return error;
+}
+
+static int
+hammer2_write_begin(const struct kiocb *iocb, struct address_space *mapping,
+    loff_t pos, unsigned len, struct folio **foliop, void **fsdata)
+{
+	struct inode *inode = mapping->host;
+	struct folio *folio;
+	int error;
+
+	/*
+	 * fgf_set_order(len) requests a folio sized for this write (capped at
+	 * one 64KiB fs block by mapping_set_folio_order_range()).  Without it
+	 * __filemap_get_folio() allocates an order-0 (4KiB) folio, so a large
+	 * write would still be split into 16 folios per block -- the order
+	 * hint is what actually collapses a 64KiB write into a single folio
+	 * op instead of 16.  A folio already present is returned as-is.
+	 */
+	folio = __filemap_get_folio(mapping, pos >> PAGE_SHIFT,
+	    FGP_WRITEBEGIN | fgf_set_order(len), mapping_gfp_mask(mapping));
+	if (IS_ERR(folio))
+		return PTR_ERR(folio);
+
+	/*
+	 * Bring the folio uptodate before the copy so that a sub-folio write
+	 * (or a write that only partially covers the trailing block) does not
+	 * expose stale page-cache contents.  A brand-new folio past EOF is
+	 * zero-filled by hammer2_fill_folio().
+	 *
+	 * When the write covers the whole folio (aligned start, len spans the
+	 * folio) there is nothing to preserve, so skip the read entirely --
+	 * the copy overwrites every byte and hammer2_write_end() marks the
+	 * folio uptodate once the full copy lands.  This keeps a synchronous
+	 * 64KiB read-modify-write out of the write(2) path for aligned
+	 * full-block overwrites, matching what block/iomap filesystems do.
+	 */
+	if (!folio_test_uptodate(folio) &&
+	    !(offset_in_folio(folio, pos) == 0 && len >= folio_size(folio))) {
+		error = hammer2_fill_folio(inode, folio);
+		if (error) {
+			folio_unlock(folio);
+			folio_put(folio);
+			return error;
+		}
+		folio_mark_uptodate(folio);
+	}
+
+	*foliop = folio;
+	return 0;
+}
+
+static int
+hammer2_write_end(const struct kiocb *iocb, struct address_space *mapping,
+    loff_t pos, unsigned len, unsigned copied, struct folio *folio,
+    void *fsdata)
+{
+	struct inode *inode = mapping->host;
+	hammer2_inode_t *ip = VTOI(inode);
+	loff_t end;
+
+	/*
+	 * A folio that is still !uptodate here had its read skipped by
+	 * hammer2_write_begin() (full-folio overwrite).  Only a copy that
+	 * filled the entire folio may mark it uptodate; a short copy would
+	 * leave uninitialised page-cache bytes, so discard it and let the
+	 * caller retry -- this mirrors block_write_end().
+	 */
+	if (!folio_test_uptodate(folio)) {
+		if (copied < len)
+			copied = 0;
+		else
+			folio_mark_uptodate(folio);
+	}
+
+	end = pos + copied;
+
+	if (copied) {
+		flush_dcache_folio(folio);
+		folio_mark_dirty(folio);
+	}
+	folio_unlock(folio);
+	folio_put(folio);
+
+	/*
+	 * Grow the file.  hammer2_resize_meta() updates ip->meta.size, marks
+	 * the inode modified (so the new size is flushed) and migrates
+	 * embedded inode data into a real block when the write crosses the
+	 * HAMMER2_EMBEDDED_BYTES boundary.
+	 */
+	if (end > i_size_read(inode)) {
+		i_size_write(inode, end);
+		hammer2_resize_meta(inode, ip, end);
+	}
+	return copied;
+}
+
+/*
+ * Write one dirty folio back to media.  Each 64KiB logical block the folio
+ * overlaps is read-modify-written so bytes owned by sibling folios (or the
+ * embedded-inode region) survive.
+ */
+static int
+hammer2_writeback_folio(struct inode *inode, struct folio *folio, char *blk)
+{
+	hammer2_inode_t *ip = VTOI(inode);
+	hammer2_pfs_t *pmp = ip->pmp;
+	loff_t fpos = folio_pos(folio);
+	size_t fsize = folio_size(folio);
+	loff_t isize = i_size_read(inode);
+	size_t done = 0;
+	int error = 0;
+
+	while (done < fsize) {
+		loff_t pos = fpos + done;
+		hammer2_key_t lbase = pos & ~(hammer2_key_t)HAMMER2_PBUFMASK;
+		int loff = (int)(pos - lbase);
+		size_t chunk = HAMMER2_PBUFSIZE - loff;
+
+		if (chunk > fsize - done)
+			chunk = fsize - done;
+		if (pos >= isize)		/* nothing live left in the folio */
+			break;
+
+		if (loff != 0 || chunk != HAMMER2_PBUFSIZE) {
 			if (hammer2_strategy_block(inode, lbase, blk,
 			    BIO_READ) != 0)
 				memset(blk, 0, HAMMER2_PBUFSIZE);
 		} else {
 			memset(blk, 0, HAMMER2_PBUFSIZE);
 		}
-
-		if (copy_from_iter(blk + loff, n, from) != n) {
-			error = -EFAULT;
-			break;
-		}
+		memcpy_from_folio(blk + loff, folio, done, chunk);
 
 		hammer2_trans_init(pmp, HAMMER2_TRANS_BUFCACHE);
 		error = hammer2_strategy_block(inode, lbase, blk, BIO_WRITE);
 		hammer2_trans_done(pmp, HAMMER2_TRANS_BUFCACHE);
 		if (error)
 			break;
+		done += chunk;
+	}
+	return error;
+}
 
-		pos += n;
-		total += n;
-		want -= n;
+static int
+hammer2_writepages(struct address_space *mapping,
+    struct writeback_control *wbc)
+{
+	struct inode *inode = mapping->host;
+	struct folio *folio = NULL;
+	char *blk;
+	int error = 0;
+
+	blk = kmalloc(HAMMER2_PBUFSIZE, GFP_KERNEL);
+	if (!blk)
+		return -ENOMEM;
+
+	while ((folio = writeback_iter(mapping, wbc, folio, &error))) {
+		folio_start_writeback(folio);
+		folio_unlock(folio);
+		error = hammer2_writeback_folio(inode, folio, blk);
+		folio_end_writeback(folio);
 	}
 
 	kfree(blk);
+	return error;
+}
 
-	/* Update modification time. */
-	hammer2_trans_init(pmp, 0);
-	hammer2_mtx_ex(&ip->lock);
-	hammer2_update_time(&mtime);
-	hammer2_inode_modify(ip);
-	ip->meta.mtime = mtime;
-	hammer2_mtx_unlock(&ip->lock);
-	hammer2_trans_done(pmp, HAMMER2_TRANS_SIDEQ);
+/*
+ * write(2) entry point.  generic_file_write_iter() drives the page cache
+ * (write_begin/copy/write_end); we retain HAMMER2's dirty-chain write
+ * throttle and read-only guard around it, and stamp mtime once per call so
+ * heavy writes do not spin a transaction per folio.  The throttle runs
+ * before generic_file_write_iter() takes the inode lock, matching the old
+ * block path's ordering so the inline flush cannot self-deadlock.
+ */
+static ssize_t
+hammer2_write_iter(struct kiocb *iocb, struct iov_iter *from)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	hammer2_inode_t *ip = VTOI(inode);
+	hammer2_pfs_t *pmp = ip->pmp;
+	uint64_t mtime;
+	ssize_t ret;
 
-	if (pos > i_size_read(inode))
-		i_size_write(inode, pos);
-	iocb->ki_pos = pos;
+	if (pmp->rdonly || (pmp->flags & HAMMER2_PMPF_EMERG))
+		return -EROFS;
 
-out_unlock:
-	inode_unlock(inode);
-	return total ? total : error;
+	hammer2_pfs_memory_wait(pmp);
+
+	ret = generic_file_write_iter(iocb, from);
+
+	if (ret > 0) {
+		hammer2_trans_init(pmp, 0);
+		hammer2_mtx_ex(&ip->lock);
+		hammer2_update_time(&mtime);
+		hammer2_inode_modify(ip);
+		ip->meta.mtime = mtime;
+		hammer2_mtx_unlock(&ip->lock);
+		hammer2_trans_done(pmp, HAMMER2_TRANS_SIDEQ);
+	}
+	return ret;
 }
 
 /*
@@ -1351,11 +1525,20 @@ static const struct file_operations hammer2_dir_fops = {
 
 static const struct file_operations hammer2_file_fops = {
 	.llseek		= generic_file_llseek,
-	.read_iter	= hammer2_read_iter,
+	.read_iter	= generic_file_read_iter,
 	.write_iter	= hammer2_write_iter,
+	.mmap		= generic_file_mmap,
 	.fsync		= hammer2_fsync,
 	.unlocked_ioctl	= hammer2_unlocked_ioctl,
 	.compat_ioctl	= compat_ptr_ioctl,
+};
+
+static const struct address_space_operations hammer2_aops = {
+	.read_folio	= hammer2_read_folio,
+	.writepages	= hammer2_writepages,
+	.write_begin	= hammer2_write_begin,
+	.write_end	= hammer2_write_end,
+	.dirty_folio	= filemap_dirty_folio,
 };
 
 /* ------------------------------------------------------------------------ */
@@ -1429,6 +1612,22 @@ hammer2_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_op = &hammer2_super_ops;
 	sb->s_time_gran = 1000;		/* HAMMER2 stores microseconds */
+
+	/*
+	 * Register a writeback-capable backing_dev_info.  get_tree_nodev()
+	 * otherwise leaves sb->s_bdi == noop_backing_dev_info, under which the
+	 * VFS writeback machinery never issues ->writepages.  Since v0.39 all
+	 * file data is written through the page cache, so without a real bdi the
+	 * dirty folios would live only in memory and be silently dropped at
+	 * unmount (inode size still commits via the chain path, but the data
+	 * blocks read back as zero after remount).  With a real bdi, sync(2) and
+	 * unmount flush dirty folios through hammer2_writepages() -> the data
+	 * chains -- before hammer2_sync_fs() commits them to the volume header.
+	 */
+	error = super_setup_bdi(sb);
+	if (error)
+		goto fail_unmount;
+
 	if (pmp->rdonly)
 		sb->s_flags |= SB_RDONLY;
 
