@@ -50,6 +50,8 @@ static hammer2_chain_t *hammer2_combined_find(hammer2_chain_t *,
 static hammer2_chain_t *hammer2_chain_lastdrop(hammer2_chain_t *, int);
 static void hammer2_chain_load_data(hammer2_chain_t *);
 static int hammer2_chain_testcheck(const hammer2_chain_t *, void *);
+static void hammer2_ckhist_record(hammer2_chain_t *, uint64_t);
+static void hammer2_chain_check_debug(hammer2_chain_t *, void *);
 
 /*
  * Basic RBTree for chains.
@@ -376,20 +378,21 @@ hammer2_chain_rehold(hammer2_chain_t *chain)
 /*
  * Handles the (potential) last drop of chain->refs from 1->0.  Called with
  * the mutex exclusively locked, refs == 1, and lockcnt 0.  SMP races are
- * possible against refs and lockcnt.  We must dispose of the mutex on chain.
+ * possible against refs and lockcnt, must dispose of the mutex on chain.
  *
- * This function returns an unlocked chain for recursive drop or NULL.
+ * function returns an unlocked chain for recursive drop or NULL.
  * It can return the same chain if it determines it has raced another ref.
  *
- * --
  * When two chains need to be recursively dropped we use the chain we
- * would otherwise free to placehold the additional chain.  It's a bit
+ * would otherwise free to placehold the additional chain. a bit
  * convoluted but we can't just recurse without potentially blowing out
  * the kernel stack.
  *
- * The chain cannot be freed if it has any children.
- * The chain cannot be freed if flagged MODIFIED unless we can dispose of it.
- * The chain cannot be freed if flagged UPDATE unless we can dispose of it.
+ * The chain cannot be freed if:
+ * it has any children.
+ * flagged MODIFIED unless we can dispose of it.
+ * flagged UPDATE unless we can dispose of it.
+ * 
  * Any dedup registration can remain intact.
  *
  * The core spinlock is allowed to nest child-to-parent (not parent-to-child).
@@ -897,8 +900,11 @@ again:
 		 * to calculate crc?  or simple crc?).
 		 */
 	} else if ((chain->flags & HAMMER2_CHAIN_TESTEDGOOD) == 0) {
-		if (hammer2_chain_testcheck(chain, bdata) == 0)
+		if (hammer2_chain_testcheck(chain, bdata) == 0) {
 			chain->error = HAMMER2_ERROR_CHECK;
+			if (hammer2_debug & 0x0200)
+				hammer2_chain_check_debug(chain, bdata);
+		}
 		else
 			atomic_set_int(&chain->flags, HAMMER2_CHAIN_TESTEDGOOD);
 	}
@@ -2034,7 +2040,7 @@ hammer2_chain_repchange(hammer2_chain_t *parent, hammer2_chain_t *chain)
  * indirect block and this function will recurse upwards and find the inode
  * or the nearest undeleted indirect block covering the key range.
  *
- * This function unconditionally sets *errorp, replacing any previous value.
+ * function unconditionally sets *errorp, replacing any previous value.
  *
  * (*parentp) must be exclusive or shared locked (depending on flags) and
  * referenced and can be an inode or an existing indirect block within the
@@ -2051,24 +2057,23 @@ hammer2_chain_repchange(hammer2_chain_t *parent, hammer2_chain_t *chain)
  *
  * The new (*parentp) will be locked shared or exclusive (depending on flags),
  * and referenced, and the old will be unlocked and dereferenced (no change
- * if they are both the same).  This is particularly important if the caller
+ * if they are both the same).  Is particularly important if the caller
  * wishes to insert a new chain, (*parentp) will be set properly even if NULL
  * is returned, as long as no error occurred.
  *
- * The matching chain will be returned locked according to flags.
+ * matching chain will be returned locked according to flags.
  *
- * --
  * NULL is returned if no match was found, but (*parentp) will still
  * potentially be adjusted.
  *
- * On return (*key_nextp) will point to an iterative value for key_beg.
+ * return (*key_nextp) will point to an iterative value for key_beg.
  * (If NULL is returned (*key_nextp) is set to (key_end + 1)).
  *
- * This function will also recurse up the chain if the key is not within the
+ * function will also recurse up the chain if the key is not within the
  * current parent's range.  (*parentp) can never be set to NULL.  An iteration
  * can simply allow (*parentp) to float inside the loop.
  *
- * NOTE!  chain->data is not always resolved.  By default it will not be
+ * NOTE:  chain->data is not always resolved.  By default it will not be
  *	  resolved for BREF_TYPE_DATA, FREEMAP_NODE, or FREEMAP_LEAF.  Use
  *	  HAMMER2_LOOKUP_ALWAYS to force resolution (but be careful w/
  *	  BREF_TYPE_DATA as the device buffer can alias the logical file
@@ -4609,6 +4614,112 @@ validate:
  * and typically only runs on-flush.  For file data check data is calculated
  * when the logical buffers are flushed.
  */
+/*
+ * setcheck history ring (hammer2_debug bit 0x0200).
+ *
+ * For DATA chains the DATA reaches media through the dio, but the CHECK CODE
+ * only reaches media inside the parent's blockref table during flush.  Those
+ * are two independent paths, so a stale check is expected to look like: the
+ * stored value matches an EARLIER setcheck for the same data_off, while the
+ * media holds the newer content.  Recording every setcheck lets the CHECKFAIL
+ * dump say which it is.
+ */
+#define HAMMER2_CKHIST		16384
+struct hammer2_ckhist {
+	uint64_t	data_off;
+	uint64_t	key;
+	uint64_t	check;
+	unsigned int	bytes;
+	unsigned int	methods;
+	unsigned long	ticks;
+};
+static struct hammer2_ckhist hammer2_ckhist[HAMMER2_CKHIST];
+static unsigned int hammer2_ckhist_idx;
+
+static void
+hammer2_ckhist_record(hammer2_chain_t *chain, uint64_t check)
+{
+	unsigned int i;
+
+	i = (unsigned int)atomic_fetchadd_32(&hammer2_ckhist_idx, 1) % HAMMER2_CKHIST;
+	hammer2_ckhist[i].data_off = chain->bref.data_off;
+	hammer2_ckhist[i].key = chain->bref.key;
+	hammer2_ckhist[i].check = check;
+	hammer2_ckhist[i].bytes = chain->bytes;
+	hammer2_ckhist[i].methods = chain->bref.methods;
+	hammer2_ckhist[i].ticks = getticks();
+}
+
+/*
+ * Diagnostic for a failed check code (enable with hammer2_debug bit 0x0200).
+ *
+ * The point is to separate two very different causes that look identical from
+ * userspace (EIO/EDOM):
+ *
+ *   media ALL-ZERO   -> the block was never written.  The check code was
+ *                       computed over data that never reached the device: a
+ *                       lost writeback (cf. the dio DIRTY-bit race fixed in
+ *                       hammer2_io.c).
+ *   media non-zero   -> the block holds *something*, so it was written and
+ *                       then reused/reallocated under this chain, or the
+ *                       check was computed over different bytes than were
+ *                       written.
+ */
+static void
+hammer2_chain_check_debug(hammer2_chain_t *chain, void *bdata)
+{
+	const unsigned char *p = bdata;
+	uint64_t computed = 0, stored = 0;
+	unsigned int i, nz = 0;
+
+	for (i = 0; i < chain->bytes; ++i) {
+		if (p[i]) {
+			nz = 1;
+			break;
+		}
+	}
+	if (HAMMER2_DEC_CHECK(chain->bref.methods) == HAMMER2_CHECK_XXHASH64) {
+		computed = XXH64(bdata, chain->bytes, XXH_HAMMER2_SEED);
+		stored = chain->bref.check.xxhash64.value;
+	}
+	hprintf("CHECKFAIL %s off %016llx bytes %u meth %02x flags %08x "
+	    "stored %016llx computed %016llx media %s "
+	    "first16 %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
+	    hammer2_breftype_to_str(chain->bref.type),
+	    (long long)chain->bref.data_off, chain->bytes, chain->bref.methods,
+	    chain->flags, (long long)stored, (long long)computed,
+	    nz ? "non-zero" : "ALL-ZERO",
+	    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+	    p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+
+	/*
+	 * The media block starts with the RIGHT bytes but does not hash right,
+	 * so it is a partial/torn block.  Sample 8 bytes every 4KiB (i.e. once
+	 * per page of the 16-page device write) so the divergence point can be
+	 * located offline: which pages made it and which did not.
+	 */
+	for (i = 0; i + 8 <= chain->bytes; i += 4096) {
+		hprintf("  PAGE %2u off %5u %02x%02x%02x%02x%02x%02x%02x%02x\n",
+		    i / 4096, i, p[i], p[i+1], p[i+2], p[i+3],
+		    p[i+4], p[i+5], p[i+6], p[i+7]);
+	}
+
+	for (i = 0; i < HAMMER2_CKHIST; ++i) {
+		if (hammer2_ckhist[i].data_off != chain->bref.data_off &&
+		    hammer2_ckhist[i].key != chain->bref.key)
+			continue;
+		hprintf("  CKHIST off %016llx key %016llx check %016llx bytes %u meth %02x "
+		    "age %lu ticks%s%s\n",
+		    (long long)hammer2_ckhist[i].data_off,
+		    (long long)hammer2_ckhist[i].key,
+		    (long long)hammer2_ckhist[i].check,
+		    hammer2_ckhist[i].bytes, hammer2_ckhist[i].methods,
+		    getticks() - hammer2_ckhist[i].ticks,
+		    hammer2_ckhist[i].check == stored ? " ==STORED" : "",
+		    hammer2_ckhist[i].check == computed ? " ==MEDIA" : "");
+	}
+}
+
 void
 hammer2_chain_setcheck(hammer2_chain_t *chain, void *bdata)
 {
@@ -4626,6 +4737,10 @@ hammer2_chain_setcheck(hammer2_chain_t *chain, void *bdata)
 	case HAMMER2_CHECK_XXHASH64:
 		chain->bref.check.xxhash64.value =
 		    XXH64(bdata, chain->bytes, XXH_HAMMER2_SEED);
+		if ((hammer2_debug & 0x0200) &&
+		    chain->bref.type == HAMMER2_BREF_TYPE_DATA)
+			hammer2_ckhist_record(chain,
+			    chain->bref.check.xxhash64.value);
 		break;
 	case HAMMER2_CHECK_SHA192:
 		{

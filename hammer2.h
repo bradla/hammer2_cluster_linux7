@@ -77,8 +77,8 @@
  * BSD TAILQ_FOREACH terminates with (var) == NULL when the list is empty or
  * exhausted, and a LOT of HAMMER2 code relies on that (e.g. iterate, then
  * `if (var == NULL)` means "not found").  Linux's list_for_each_entry leaves
- * the iterator pointing at the list head (container_of(head,...)) -- a bogus
- * non-NULL pointer -- which makes those checks fail and dereference garbage.
+ * the iterator pointing at the list head (container_of(head,...)) a bogus
+ * non-NULL pointer which makes those checks fail and dereference garbage.
  * So implement BSD NULL-terminating semantics explicitly.
  */
 #define TAILQ_FOREACH(var, hp, field) \
@@ -396,7 +396,7 @@ int  hammer2_bulkfree_pass(hammer2_dev_t *hmp, hammer2_chain_t *vchain,
 		struct hammer2_ioc_bulkfree *bfi);
 
 /* XOP descriptor objects (defined in hammer2_admin.c) live after the
- * hammer2_xop_desc_t typedef -- declare them below as extern struct. */
+ * hammer2_xop_desc_t typedef declare them below as extern struct. */
 struct hammer2_xop_desc;
 extern struct hammer2_xop_desc hammer2_unlink_desc;
 extern struct hammer2_xop_desc hammer2_scanlhc_desc;
@@ -445,7 +445,7 @@ void hammer2_freemap_adjust(hammer2_dev_t *hmp, hammer2_blockref_t *bref,
 int  hammer2_flush(hammer2_chain_t *chain, int flags);
 void hammer2_chain_init(hammer2_chain_t *chain);
 void hammer2_inode_modify(hammer2_inode_t *ip);
-/* hammer2_chain_insert/repparent are static within chain.c -- no extern decl. */
+/* hammer2_chain_insert/repparent are static within chain.c no extern decl. */
 int  hammer2_chain_delete(hammer2_chain_t *parent, hammer2_chain_t *chain,
 		hammer2_tid_t mtid, int flags);
 void hammer2_base_insert(hammer2_chain_t *parent, hammer2_blockref_t *base,
@@ -464,9 +464,9 @@ hammer2_chain_t *hammer2_inode_chain_and_parent(hammer2_inode_t *ip,
 #define pause(msg, ticks) \
 	do { (void)(msg); schedule_timeout_uninterruptible((ticks) ?: 1); } while (0)
 /*
- * BSD tsleep(channel, prio, label, ticks) -- the channel matches a future
+ * BSD tsleep(channel, prio, label, ticks) channel matches a future
  * wakeup() call; in the absence of an explicit wakeup it just times out.
- * The HAMMER2 callers use it as a throttle/yield, so a plain interruptible
+ * callers use it as a throttle/yield, so a plain interruptible
  * sleep with the requested tick count is functionally equivalent.
  */
 /* Statement-expression form so call sites can use tsleep as an rvalue. */
@@ -698,6 +698,14 @@ struct hammer2_chain {
 /*
  * HAMMER2 error codes.
  */
+/*
+ * Consecutive hammer2_vfs_sync_pmp() passes that each failed to write out at
+ * least one inode before the sync gives up instead of restarting forever.
+ * Reached in milliseconds when the device is gone; far more retrying than any
+ * transient failure needs.
+ */
+#define HAMMER2_SYNC_IOFAIL_MAX	64
+
 #define HAMMER2_ERROR_EIO       0x00000001
 #define HAMMER2_ERROR_CHECK     0x00000002
 #define HAMMER2_ERROR_BADBREF   0x00000010
@@ -758,6 +766,14 @@ struct hammer2_chain {
  * HAMMER2 cluster.
  */
 #define HAMMER2_XOPFIFO        16
+/*
+ * Cap for HAMMER2_XOP_FIFO_BOUND XOPs: grow the collect FIFO up to this many
+ * entries, then stop feeding and let the caller resume from its cursor.
+ * Bounding at HAMMER2_XOPFIFO alone is correct but costs an XOP start (and a
+ * btree seek) every 16 entries; 1024 keeps readdir near-linear without
+ * buffering the whole directory.
+ */
+#define HAMMER2_XOPFIFO_BOUND  1024
 
 #define HAMMER2_MAXCLUSTER     8
 #define HAMMER2_XOPMASK_VOP    ((uint32_t)0x80000000U)
@@ -797,6 +813,18 @@ struct hammer2_inode {
     hammer2_depend_t         depend_static;
     hammer2_mtx_t            lock;
     hammer2_mtx_t            truncate_lock;
+    /*
+     * Serializes the read-modify-write of a 64KiB logical block in
+     * hammer2_writeback_folio().  Writing one folio of a larger block means
+     * read the whole block, overlay the folio, write the whole block back 
+     * and two threads doing that concurrently (writeback kworker plus the
+     * inline sync) interleave: the later write is built on a stale read and
+     * clobbers the earlier one, while the blockref check code comes from
+     * whichever setcheck ran last.  Media then holds a SPLICE of two versions
+     * with a check code matching neither observed as pages 0-5 of one file
+     * followed by pages 6-15 of the block's previous occupant.
+     */
+    hammer2_mtx_t            rmw_lock;
     hammer2_spin_t           cluster_spin;
     hammer2_cluster_t        cluster;
     hammer2_cluster_item_t   ccache[HAMMER2_MAXCLUSTER];
@@ -1074,6 +1102,22 @@ union hammer2_xop {
 #define HAMMER2_XOP_INODE_STOP    0x00000004
 #define HAMMER2_XOP_VOLHDR        0x00000008
 #define HAMMER2_XOP_FSSYNC        0x00000010
+/*
+ * Do not block acquiring the per-inode XOP interlock; abort the XOP instead.
+ * Used by background writeback, which must not sit in hammer2_xop_testset_ipdep
+ * while it holds folios marked under-writeback (see hammer2_writepages).
+ */
+#define HAMMER2_XOP_NONBLOCK      0x00000020
+/* Set by xop_start when NONBLOCK could not acquire the interlock. */
+#define HAMMER2_XOP_ABORTED       0x00000040
+/*
+ * Do not grow the collect FIFO without bound; stop feeding when it is full.
+ * Only safe for XOPs whose caller can resume from a cursor (readdir), and
+ * required there: XOPs run inline in this port, so hammer2_xop_feed() cannot
+ * sleep for flow control and instead doubles the FIFO which makes every
+ * getdents() buffer the whole remaining directory and readdir O(n^2).
+ */
+#define HAMMER2_XOP_FIFO_BOUND    0x00000080
 
 /*
  * Device vnode management structure (Linux uses block_device).
@@ -1160,6 +1204,12 @@ struct hammer2_dev {
     hammer2_lk_t             bulklk;
     hammer2_lk_t             bflk;
     int                      freemap_relaxed;
+    /*
+     * Bumped on every failed device I/O.  hammer2_vfs_sync_pmp() samples it
+     * across a sync pass to tell a transient failure (retry) from a device
+     * that is simply gone (stop retrying) HAMMER2_SYNC_IOFAIL_MAX.
+     */
+    int                      iofail_count;
     u64                      free_reserved;
     u64                      heur_freemap[HAMMER2_FREEMAP_HEUR_SIZE];
     hammer2_dedup_t          heur_dedup[HAMMER2_DEDUP_HEUR_SIZE];
@@ -1281,6 +1331,7 @@ extern hammer2_lk_t hammer2_mntlk;
 extern int hammer2_cluster_meta_read;
 extern int hammer2_cluster_data_read;
 extern int hammer2_cluster_write;
+extern int hammer2_fsync_durable;
 extern int hammer2_dedup_enable;
 extern int hammer2_count_inode_allocated;
 extern int hammer2_count_chain_allocated;

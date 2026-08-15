@@ -569,6 +569,7 @@ hammer2_inode_drop(hammer2_inode_t *ip)
 				hammer2_inode_repoint(ip, NULL);
 				hammer2_mtx_destroy(&ip->lock);
 				hammer2_mtx_destroy(&ip->truncate_lock);
+				hammer2_mtx_destroy(&ip->rmw_lock);
 				hammer2_spin_destroy(&ip->cluster_spin);
 
 				uma_zfree(hammer2_zone_inode, ip);
@@ -726,6 +727,7 @@ again:
 	nip->refs = 1;
 	hammer2_mtx_init_recurse(&nip->lock, "h2ip");
 	hammer2_mtx_init(&nip->truncate_lock, "h2ip_tr");
+	hammer2_mtx_init(&nip->rmw_lock, "h2ip_rmw");
 	hammer2_mtx_ex(&nip->lock);
 	TAILQ_INIT(&nip->depend_static.sideq);
 	/*
@@ -882,7 +884,7 @@ vop_helper_create_uid(void *mp, mode_t dmode, uid_t duid,
 {
 	(void)mp;
 #ifdef SUIDDIR
-	if (0 /* (mp->mnt_flag & MNT_SUIDDIR) -- BSD-only */ &&
+	if (0 /* (mp->mnt_flag & MNT_SUIDDIR) BSD-only */ &&
 	    (dmode & S_ISUID) &&
 	    duid != cred->cr_uid && duid) {
 		*modep &= ~07111;
@@ -965,10 +967,22 @@ hammer2_inode_create_normal(hammer2_inode_t *pip, struct vattr *vap,
 	 * tooling (a dir written here rmdir'd on DragonFly frees correctly).
 	 */
 	nip->meta.nlinks = 1;
-	if ((nip->meta.mode & S_ISGID) &&
-	    !groupmember(hammer2_inode_to_gid(nip), cred))
-		if (priv_check_cred(cred, PRIV_VFS_RETAINSUGID))
-			nip->meta.mode &= ~S_ISGID;
+	/*
+	 * Linux semantics, as inode_init_owner() implements them: a new
+	 * DIRECTORY keeps an inherited setgid bit; a non-directory loses it only
+	 * if it is group-executable and the caller is neither in the group nor
+	 * privileged.
+	 *
+	 * The BSD original consulted groupmember() and priv_check_cred(), which
+	 * are stubs in this port returning "not a member" and "not privileged"
+	 * respectively so the strip was UNCONDITIONAL and nothing created here
+	 * could ever carry S_ISGID (xfstests generic/314).  It also read
+	 * nip->meta.gid before that field was assigned, a few lines below.
+	 */
+	if ((nip->meta.mode & S_ISGID) && !S_ISDIR(vap->va_mode) &&
+	    (nip->meta.mode & S_IXGRP) && !capable(CAP_FSETID) &&
+	    !in_group_p(make_kgid(&init_user_ns, vap->va_gid)))
+		nip->meta.mode &= ~S_ISGID;
 
 	xuid = hammer2_to_unix_xid(&pip_uid);
 	xuid = vop_helper_create_uid(dip->pmp->mp, pip_mode, xuid, cred,
@@ -1394,6 +1408,7 @@ hammer2_inode_chain_sync(hammer2_inode_t *ip)
 {
 	hammer2_xop_fsync_t *xop;
 	int error = 0;
+	int cleared_dd = 0, saved_ipflags = 0;
 
 	if (ip->flags & (HAMMER2_INODE_RESIZED | HAMMER2_INODE_MODIFIED)) {
 		xop = hammer2_xop_alloc(ip, HAMMER2_XOP_MODIFYING);
@@ -1410,17 +1425,34 @@ hammer2_inode_chain_sync(hammer2_inode_t *ip)
 		}
 		xop->ipflags = ip->flags;
 		xop->meta = ip->meta;
+		saved_ipflags = ip->flags;
 		atomic_clear_int(&ip->flags,
 		    HAMMER2_INODE_RESIZED | HAMMER2_INODE_MODIFIED);
 		hammer2_xop_start(&xop->head, &hammer2_inode_chain_sync_desc);
 		error = hammer2_xop_collect(&xop->head, 0);
+		cleared_dd = xop->clear_directdata;	/* xop dies on retire */
 		hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
 		if (error == HAMMER2_ERROR_ENOENT)
 			error = 0;
 		if (error) {
-			hprintf("unable to fsync inode %016llx\n",
-			    (long long)ip->meta.inum);
-			/* XXX return error somehow? */
+			hprintf("unable to fsync inode %016llx (error %02x)\n",
+			    (long long)ip->meta.inum, error);
+			/*
+			 * frontend state was cleared BEFORE the backend ran, so
+			 * failure the modification would be dropped on the floor
+			 * and never retried and worse, DIRECTDATA was already
+			 * cleared in ip->meta while the chain still holds embedded
+			 * data. That inconsistency is what later fires the
+			 * KKASSERT(wipdata->meta.op_flags & DIRECTDATA) in
+			 * hammer2_compress_and_write() and BUGs the kernel.
+			 *
+			 * Put the state back and requeue so the sync is retried.
+			 */
+			if (cleared_dd)
+				ip->meta.op_flags |= HAMMER2_OPFLAG_DIRECTDATA;
+			atomic_set_int(&ip->flags, saved_ipflags &
+			    (HAMMER2_INODE_RESIZED | HAMMER2_INODE_MODIFIED));
+			hammer2_inode_delayed_sideq(ip);
 		}
 	}
 
@@ -1448,9 +1480,15 @@ hammer2_inode_chain_ins(hammer2_inode_t *ip)
 		if (error == HAMMER2_ERROR_ENOENT)
 			error = 0;
 		if (error) {
-			hprintf("backend unable to insert inum %016llx\n",
-			    (long long)ip->meta.inum);
-			/* XXX return error somehow? */
+			hprintf("backend unable to insert inum %016llx (error %02x)\n",
+			    (long long)ip->meta.inum, error);
+			/*
+			 * CREATING was cleared before the backend ran; without
+			 * restoring it the inode is never inserted into the media
+			 * topology and nothing ever retries.
+			 */
+			atomic_set_int(&ip->flags, HAMMER2_INODE_CREATING);
+			hammer2_inode_delayed_sideq(ip);
 		}
 	}
 	return (error);
@@ -1484,9 +1522,14 @@ hammer2_inode_chain_des(hammer2_inode_t *ip)
 		if (error == HAMMER2_ERROR_ENOENT)
 			error = 0;
 		if (error) {
-			hprintf("backend unable to delete inode %016llx\n",
-			    (long long)ip->meta.inum);
-			/* XXX return error somehow? */
+			hprintf("backend unable to delete inode %016llx (error %02x)\n",
+			    (long long)ip->meta.inum, error);
+			/*
+			 * DELETING was cleared before the backend ran; restore it so
+			 * the destroy is retried rather than leaking the inode.
+			 */
+			atomic_set_int(&ip->flags, HAMMER2_INODE_DELETING);
+			hammer2_inode_delayed_sideq(ip);
 		}
 	}
 	return (error);

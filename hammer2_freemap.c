@@ -282,7 +282,17 @@ hammer2_freemap_try_alloc(hammer2_chain_t **parentp, hammer2_blockref_t *bref,
 		    HAMMER2_METH_DEFAULT, key, HAMMER2_FREEMAP_LEVEL1_RADIX,
 		    HAMMER2_BREF_TYPE_FREEMAP_LEAF, HAMMER2_FREEMAP_LEVELN_PSIZE,
 		    mtid, 0, 0);
-		KKASSERT(error == 0);
+		/*
+		 * NOT an assertion.  hammer2_chain_create() fails for ordinary
+		 * reasons ENOSPC above all and the `if (error == 0)` below
+		 * already handles that, letting the error propagate to the caller.
+		 * KKASSERT() here turned a full filesystem into
+		 *   kernel BUG at hammer2_freemap.c:285
+		 * i.e. any user could take the machine down by filling the disk.
+		 * Found by xfstests generic/341 on a scratch device that filled up.
+		 */
+		if (error)
+			hprintf("chain_create failed: error %02x\n", error);
 		if (error == 0) {
 			hammer2_chain_modify(chain, mtid, 0, 0);
 			bzero(&chain->data->bmdata[0],
@@ -294,7 +304,7 @@ hammer2_freemap_try_alloc(hammer2_chain_t **parentp, hammer2_blockref_t *bref,
 		}
 	} else if (chain->error) {
 		/* Error during lookup. */
-		hprintf("error %d at data_off %016llx\n",
+		hprintf_rl("error %d at data_off %016llx\n",
 		    chain->error, (long long)bref->data_off);
 		error = HAMMER2_ERROR_EIO;
 	} else if ((chain->bref.check.freemap.bigmask &
@@ -314,7 +324,7 @@ hammer2_freemap_try_alloc(hammer2_chain_t **parentp, hammer2_blockref_t *bref,
 		KKASSERT(start >= 0 && start < HAMMER2_FREEMAP_COUNT);
 		/*
 		 * COW the freemap leaf for adjustment.  If the modify fails do
-		 * NOT scan/mutate the bitmap -- that would write allocation bits
+		 * NOT scan/mutate the bitmap that would write allocation bits
 		 * into a chain that was not successfully instantiated and then
 		 * falsely report the allocation as successful.
 		 */
@@ -842,7 +852,7 @@ hammer2_freemap_adjust(hammer2_dev_t *hmp, hammer2_blockref_t *bref, int how)
 
 	/* Stop early if we are trying to free something but no leaf exists. */
 	if (chain == NULL && how != HAMMER2_FREEMAP_DORECOVER) {
-		hprintf("no chain at data_off %016llx\n",
+		hprintf_rl("no chain at data_off %016llx\n",
 		    (long long)bref->data_off);
 		goto done;
 	}
@@ -852,7 +862,7 @@ hammer2_freemap_adjust(hammer2_dev_t *hmp, hammer2_blockref_t *bref, int how)
 	 * error check so we don't dereference a NULL chain.
 	 */
 	if (chain && chain->error) {
-		hprintf("error %d at data_off %016llx\n",
+		hprintf_rl("error %d at data_off %016llx\n",
 		    chain->error, (long long)bref->data_off);
 		hammer2_chain_unlock(chain);
 		hammer2_chain_drop(chain);

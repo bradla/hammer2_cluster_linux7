@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 /*
- * hammer2_linux_vfs.c -- Linux VFS glue for the HAMMER2 filesystem port.
+ * hammer2_linux_vfs.c Linux VFS glue for the HAMMER2 filesystem port.
  *
  * The HAMMER2 internals (chains, freemap, flush, XOPs, dedup, LZ4, the
  * device-buffer I/O layer in hammer2_io.c, and the logical-block strategy
@@ -26,6 +26,8 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/fs.h>
+#include <linux/blkdev.h>	/* sync_blockdev, blkdev_issue_flush */
+#include <linux/buffer_head.h>
 #include <linux/fs_context.h>
 #include <linux/pagemap.h>
 #include <linux/highmem.h>
@@ -227,7 +229,7 @@ hammer2_iget(struct super_block *sb, hammer2_inode_t *ip)
  */
 static int
 hammer2_strategy_block(struct inode *inode, hammer2_key_t lbase, char *data,
-    int iocmd)
+    int iocmd, int nowait)
 {
 	struct vop_strategy_args ap;
 	struct buf b;
@@ -241,6 +243,7 @@ hammer2_strategy_block(struct inode *inode, hammer2_key_t lbase, char *data,
 	b.b_resid = HAMMER2_PBUFSIZE;
 	b.b_lblkno = lbase / HAMMER2_PBUFSIZE;
 	b.b_blkno = b.b_lblkno;
+	b.b_flags = nowait ? B_NOWAIT : 0;
 
 	ap.a_vp = inode;
 	ap.a_bp = &b;
@@ -291,7 +294,7 @@ hammer2_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		if ((loff_t)(pos + n) > isize)
 			n = (size_t)(isize - pos);
 
-		error = hammer2_strategy_block(inode, lbase, blk, BIO_READ);
+		error = hammer2_strategy_block(inode, lbase, blk, BIO_READ, 0);
 		if (error)
 			break;
 		if (copy_to_iter(blk + loff, n, to) != n) {
@@ -305,6 +308,14 @@ hammer2_read_iter(struct kiocb *iocb, struct iov_iter *to)
 
 	kfree(blk);
 	iocb->ki_pos = pos;
+	/*
+	 * a hand-rolled read loop rather than generic_file_read_iter(),
+	 * so nothing was updating the access time atime never advanced at all
+	 * (xfstests generic/003).  file_accessed() applies the mount's atime
+	 * policy (relatime/noatime) for us.
+	 */
+	if (total > 0)
+		file_accessed(iocb->ki_filp);
 	return total ? total : error;
 }
 
@@ -336,7 +347,7 @@ hammer2_get_link(struct dentry *dentry, struct inode *inode,
 	if (!blk)
 		return ERR_PTR(-ENOMEM);
 
-	error = hammer2_strategy_block(inode, 0, blk, BIO_READ);
+	error = hammer2_strategy_block(inode, 0, blk, BIO_READ, 0);
 	if (error) {
 		kfree(blk);
 		return ERR_PTR(error);
@@ -349,7 +360,20 @@ hammer2_get_link(struct dentry *dentry, struct inode *inode,
 }
 
 /*
- * Directory lookup -- resolve a name to its inode via the nresolve XOP.
+ * Longest legal name component.  HAMMER2 stores the name in a 256-byte field
+ * (HAMMER2_INODE_MAXNAME) and hammer2_dirent_create() asserts
+ * name_len < HAMMER2_INODE_MAXNAME, so 255 is the maximum not 256.
+ *
+ * The guards below used to read "> HAMMER2_INODE_MAXNAME", which let a
+ * 256-byte component through to that assert and BUG()'d the kernel: an
+ * unprivileged panic, one mkdir away.  statfs() also advertised 256 as
+ * NAME_MAX, so a conforming application asking pathconf(_PC_NAME_MAX) was
+ * told to use exactly the length that panics.  Found by fstest chmod/03.t.
+ */
+#define HAMMER2_NAME_MAX	(HAMMER2_INODE_MAXNAME - 1)
+
+/*
+ * Directory lookup resolve a name to its inode via the nresolve XOP.
  */
 static struct dentry *
 hammer2_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
@@ -360,7 +384,7 @@ hammer2_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 	struct inode *inode = NULL;
 	int error;
 
-	if (dentry->d_name.len > HAMMER2_INODE_MAXNAME)
+	if (dentry->d_name.len > HAMMER2_NAME_MAX)
 		return ERR_PTR(-ENAMETOOLONG);
 
 	hammer2_inode_lock(dip, HAMMER2_RESOLVE_SHARED);
@@ -435,7 +459,12 @@ hammer2_iterate(struct file *file, struct dir_context *ctx)
 		ctx->pos = ++saveoff;
 	}
 
-	xop = hammer2_xop_alloc(ip, 0);
+	/*
+	 * Bounded FIFO: without it the backend buffers every remaining entry on
+	 * each getdents() call while we consume only a bufferful, making readdir
+	 * O(n^2) (measured 15.8s for 20k entries).  We resume from ctx->pos.
+	 */
+	xop = hammer2_xop_alloc(ip, HAMMER2_XOP_FIFO_BOUND);
 	xop->lkey = saveoff | HAMMER2_DIRHASH_VISIBLE;
 	hammer2_xop_start(&xop->head, &hammer2_readdir_desc);
 
@@ -512,11 +541,91 @@ hammer2_getattr(struct mnt_idmap *idmap, const struct path *path,
 }
 
 /* Shrink or grow the on-media file, updating in-memory inode metadata. */
+/*
+ * Zero the part of the straddling block that a truncate left beyond EOF.
+ *
+ * hammer2_xop_inode_chain_sync() deletes whole DATA chains past the new EOF,
+ * but the 64KiB block containing the new EOF keeps its old contents.  Extend
+ * the file again and those bytes reappear as file data: fsx caught exactly
+ * that (generic/075):
+ *
+ *   TRUNCATE DOWN 0x40000 -> 0x22030
+ *   TRUNCATE UP   0x22030 -> 0x36612
+ *   MAPREAD 0x1a6fe..0x29c03  -> mismatch at 0x2f3b5, inside 0x20000-0x30000
+ *
+ * Zero [osize, end-of-that-block) through the page cache once the size has
+ * grown, so the region is inside EOF and writeback rewrites the block.
+ *
+ * A write(2) that extends EOF needs this too truncate down to 0x61b6, then
+ * write at 0x1c236, and the hole left behind exposed the old tail of the first
+ * block (generic/075 again, at op 104).  But such a write supplies the bytes
+ * for [pos, end) itself and hammer2_write_end() has already copied them into
+ * the page cache, so zeroing that far discards the write.  Callers cap the
+ * range with nsize: pass the start of the caller-supplied data, so only the
+ * hole ahead of it is zeroed.  See hammer2_resize_meta().
+ */
 static void
-hammer2_resize_meta(struct inode *inode, hammer2_inode_t *ip, loff_t nsize)
+hammer2_zero_extend_tail(struct inode *inode, loff_t osize, loff_t nsize)
+{
+	struct address_space *mapping = inode->i_mapping;
+	struct folio *folio;
+	loff_t pos, zend;
+
+	if (nsize <= osize || (osize & HAMMER2_PBUFMASK) == 0)
+		return;
+
+	zend = (osize + HAMMER2_PBUFSIZE) & ~(loff_t)HAMMER2_PBUFMASK;
+	if (zend > nsize)
+		zend = nsize;
+
+	for (pos = osize; pos < zend; ) {
+		size_t off, len;
+
+		folio = __filemap_get_folio(mapping, pos >> PAGE_SHIFT,
+		    FGP_LOCK | FGP_CREAT, mapping_gfp_mask(mapping));
+		if (IS_ERR(folio))
+			break;
+		if (!folio_test_uptodate(folio))
+			folio_zero_range(folio, 0, folio_size(folio));
+		off = offset_in_folio(folio, pos);
+		len = folio_size(folio) - off;
+		if (pos + (loff_t)len > zend)
+			len = zend - pos;
+		folio_zero_range(folio, off, len);
+		folio_mark_uptodate(folio);
+		filemap_dirty_folio(mapping, folio);
+		folio_unlock(folio);
+		folio_put(folio);
+		pos += len;
+	}
+}
+
+static void
+hammer2_resize_meta(struct inode *inode, hammer2_inode_t *ip, loff_t nsize,
+    loff_t zlimit)
 {
 	hammer2_pfs_t *pmp = ip->pmp;
+	struct folio *folio = NULL;
 	loff_t osize;
+	int crossing;
+
+	/*
+	 * Growing past the embedded-data limit reuses the inode's union for the
+	 * blockref table, the bytes living there must reach a real DATA block
+	 * or they are simply lost write 40 bytes, truncate to 4, extend to
+	 * 4096, and after a remount the 4 surviving bytes were gone (xfstests
+	 * generic/393).  Pull them into the page cache BEFORE the conversion
+	 * (afterwards a read would see the zeroed union) and dirty the folio
+	 * after it, so writeback allocates a normal block for them.
+	 */
+	osize = i_size_read(inode);
+	crossing = (osize > 0 && osize <= HAMMER2_EMBEDDED_BYTES &&
+	    nsize > HAMMER2_EMBEDDED_BYTES);
+	if (crossing) {
+		folio = read_mapping_folio(inode->i_mapping, 0, NULL);
+		if (IS_ERR(folio))
+			folio = NULL;
+	}
 
 	hammer2_trans_init(pmp, 0);
 	hammer2_mtx_ex(&ip->lock);
@@ -544,7 +653,31 @@ hammer2_resize_meta(struct inode *inode, hammer2_inode_t *ip, loff_t nsize)
 	hammer2_trans_done(pmp, HAMMER2_TRANS_SIDEQ);
 
 	i_size_write(inode, nsize);
-	truncate_inode_pages(&inode->i_data, nsize);
+
+	/*
+	 * Page cache may only be discarded on a shrink.  Both call sites reach
+	 * here, and on a write(2)-driven growth the folio the copy just landed
+	 * in still has to reach writeback.  truncate_pagecache() also unmaps
+	 * the truncated range, which plain truncate_inode_pages() does not 
+	 * mmap of a file shrunk by ftruncate(2) kept its stale mappings.
+	 *
+	 * On a growth, zlimit bounds stale-tail zeroing to the region the caller
+	 * has NOT filled itself: truncate(2) passes nsize (zero the whole stale
+	 * tail), write(2) passes the start of its copy (zero only the hole in
+	 * front of it, never the bytes just written).
+	 */
+	if (nsize < osize)
+		truncate_pagecache(inode, nsize);
+	else
+		hammer2_zero_extend_tail(inode, osize, min(nsize, zlimit));
+
+	if (folio) {
+		folio_lock(folio);
+		if (folio->mapping == inode->i_mapping)
+			filemap_dirty_folio(inode->i_mapping, folio);
+		folio_unlock(folio);
+		folio_put(folio);
+	}
 }
 
 static int
@@ -568,7 +701,7 @@ hammer2_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		return -EISDIR;
 
 	if ((iattr->ia_valid & ATTR_SIZE) && iattr->ia_size != i_size_read(inode))
-		hammer2_resize_meta(inode, ip, iattr->ia_size);
+		hammer2_resize_meta(inode, ip, iattr->ia_size, iattr->ia_size);
 
 	hammer2_trans_init(pmp, 0);
 	hammer2_mtx_ex(&ip->lock);
@@ -590,12 +723,23 @@ hammer2_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		ip->meta.mtime = hammer2_timespec_to_time(&iattr->ia_mtime);
 	if (iattr->ia_valid & ATTR_ATIME)
 		ip->meta.atime = hammer2_timespec_to_time(&iattr->ia_atime);
-	if (iattr->ia_valid & (ATTR_CTIME | ATTR_MODE))
+	/*
+	 * A size change updates BOTH mtime and ctime, and the filesystem has to
+	 * do it: path-based truncate(2) reaches do_truncate() with time_attrs=0
+	 * (only ftruncate(2) passes ATTR_MTIME|ATTR_CTIME), so relying on
+	 * ia_valid leaves the timestamps untouched.  fstest truncate/00.t.
+	 */
+	if (iattr->ia_valid & ATTR_SIZE)
+		ip->meta.mtime = ctime;
+	if (iattr->ia_valid & (ATTR_CTIME | ATTR_MODE | ATTR_SIZE))
 		ip->meta.ctime = ctime;
 	hammer2_mtx_unlock(&ip->lock);
 	hammer2_trans_done(pmp, HAMMER2_TRANS_SIDEQ);
 
 	setattr_copy(idmap, inode, iattr);
+	/* setattr_copy() only carries times that are in ia_valid (see above). */
+	if (iattr->ia_valid & ATTR_SIZE)
+		inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
 	mark_inode_dirty(inode);
 	return 0;
 }
@@ -656,7 +800,7 @@ hammer2_fill_folio(struct inode *inode, struct folio *folio)
 			break;
 		}
 
-		error = hammer2_strategy_block(inode, lbase, blk, BIO_READ);
+		error = hammer2_strategy_block(inode, lbase, blk, BIO_READ, 0);
 		if (error)
 			goto out;
 
@@ -696,7 +840,7 @@ hammer2_write_begin(const struct kiocb *iocb, struct address_space *mapping,
 	 * fgf_set_order(len) requests a folio sized for this write (capped at
 	 * one 64KiB fs block by mapping_set_folio_order_range()).  Without it
 	 * __filemap_get_folio() allocates an order-0 (4KiB) folio, so a large
-	 * write would still be split into 16 folios per block -- the order
+	 * write would still be split into 16 folios per block the order
 	 * hint is what actually collapses a 64KiB write into a single folio
 	 * op instead of 16.  A folio already present is returned as-is.
 	 */
@@ -712,7 +856,7 @@ hammer2_write_begin(const struct kiocb *iocb, struct address_space *mapping,
 	 * zero-filled by hammer2_fill_folio().
 	 *
 	 * When the write covers the whole folio (aligned start, len spans the
-	 * folio) there is nothing to preserve, so skip the read entirely --
+	 * folio) there is nothing to preserve, so skip the read entirely 
 	 * the copy overwrites every byte and hammer2_write_end() marks the
 	 * folio uptodate once the full copy lands.  This keeps a synchronous
 	 * 64KiB read-modify-write out of the write(2) path for aligned
@@ -747,7 +891,7 @@ hammer2_write_end(const struct kiocb *iocb, struct address_space *mapping,
 	 * hammer2_write_begin() (full-folio overwrite).  Only a copy that
 	 * filled the entire folio may mark it uptodate; a short copy would
 	 * leave uninitialised page-cache bytes, so discard it and let the
-	 * caller retry -- this mirrors block_write_end().
+	 * caller retry this mirrors block_write_end().
 	 */
 	if (!folio_test_uptodate(folio)) {
 		if (copied < len)
@@ -773,7 +917,7 @@ hammer2_write_end(const struct kiocb *iocb, struct address_space *mapping,
 	 */
 	if (end > i_size_read(inode)) {
 		i_size_write(inode, end);
-		hammer2_resize_meta(inode, ip, end);
+		hammer2_resize_meta(inode, ip, end, pos);
 	}
 	return copied;
 }
@@ -784,7 +928,8 @@ hammer2_write_end(const struct kiocb *iocb, struct address_space *mapping,
  * embedded-inode region) survive.
  */
 static int
-hammer2_writeback_folio(struct inode *inode, struct folio *folio, char *blk)
+hammer2_writeback_folio(struct inode *inode, struct folio *folio, char *blk,
+    int nowait)
 {
 	hammer2_inode_t *ip = VTOI(inode);
 	hammer2_pfs_t *pmp = ip->pmp;
@@ -805,17 +950,52 @@ hammer2_writeback_folio(struct inode *inode, struct folio *folio, char *blk)
 		if (pos >= isize)		/* nothing live left in the folio */
 			break;
 
+		/*
+		 * Serialize the whole read-modify-write of this logical block.
+		 * Two threads (writeback kworker + the inline sync from
+		 * hammer2_pfs_memory_wait) otherwise interleave read/overlay/write
+		 * on the same 64KiB block: the later write is assembled from a
+		 * stale read and clobbers the earlier one, while the blockref check
+		 * code is whichever setcheck landed last.  Media then holds a splice
+		 * of two versions with a check matching neither.
+		 */
+		/*
+		 * Transaction OUTSIDE the rmw_lock, deliberately.  Holding the lock
+		 * across hammer2_trans_init() deadlocks: the flusher holds an ISFLUSH
+		 * transaction and then wants rmw_lock (write_inode_now ->
+		 * hammer2_writepages), while the rmw_lock holder waits for a BUFCACHE
+		 * transaction that ISFLUSH blocks.  Acquiring the transaction first
+		 * means nothing ever blocks on a transaction while holding rmw_lock,
+		 * so the lock holder always makes progress.
+		 */
+		hammer2_trans_init(pmp, HAMMER2_TRANS_BUFCACHE);
+		hammer2_mtx_ex(&ip->rmw_lock);
 		if (loff != 0 || chunk != HAMMER2_PBUFSIZE) {
-			if (hammer2_strategy_block(inode, lbase, blk,
-			    BIO_READ) != 0)
+			/*
+			 * Read-modify-write.  deferral must NOT fall into the
+			 * zero-fill below that would write zeroes over the part
+			 * of the block this folio does not cover.  Propagate EAGAIN
+			 * and let the caller redirty the folio instead.
+			 */
+			error = hammer2_strategy_block(inode, lbase, blk,
+			    BIO_READ, nowait);
+			if (error == -EAGAIN) {
+				hammer2_mtx_unlock(&ip->rmw_lock);
+				hammer2_trans_done(pmp, HAMMER2_TRANS_BUFCACHE);
+				break;
+			}
+			if (error != 0) {
 				memset(blk, 0, HAMMER2_PBUFSIZE);
+				error = 0;
+			}
 		} else {
 			memset(blk, 0, HAMMER2_PBUFSIZE);
 		}
 		memcpy_from_folio(blk + loff, folio, done, chunk);
 
-		hammer2_trans_init(pmp, HAMMER2_TRANS_BUFCACHE);
-		error = hammer2_strategy_block(inode, lbase, blk, BIO_WRITE);
+		error = hammer2_strategy_block(inode, lbase, blk, BIO_WRITE,
+		    nowait);
+		hammer2_mtx_unlock(&ip->rmw_lock);
 		hammer2_trans_done(pmp, HAMMER2_TRANS_BUFCACHE);
 		if (error)
 			break;
@@ -832,15 +1012,32 @@ hammer2_writepages(struct address_space *mapping,
 	struct folio *folio = NULL;
 	char *blk;
 	int error = 0;
+	int nowait;
 
 	blk = kmalloc(HAMMER2_PBUFSIZE, GFP_KERNEL);
 	if (!blk)
 		return -ENOMEM;
 
+	/*
+	 * Background writeback (WB_SYNC_NONE) may defer a folio whose inode is
+	 * busy in another XOP: blocking here would hold the folio in writeback
+	 * state (and a BUFCACHE transaction) while the interlock holder may be
+	 * waiting on exactly that, which deadlocks.  Data-integrity writeback
+	 * (WB_SYNC_ALL, i.e. fsync/sync) must not skip anything, so it blocks.
+	 */
+	nowait = (wbc->sync_mode == WB_SYNC_NONE);
+
 	while ((folio = writeback_iter(mapping, wbc, folio, &error))) {
 		folio_start_writeback(folio);
 		folio_unlock(folio);
-		error = hammer2_writeback_folio(inode, folio, blk);
+		error = hammer2_writeback_folio(inode, folio, blk, nowait);
+		if (error == -EAGAIN) {
+			/* Interlock busy: leave it dirty and come back later. */
+			folio_end_writeback(folio);
+			filemap_dirty_folio(mapping, folio);
+			error = 0;
+			continue;
+		}
 		folio_end_writeback(folio);
 	}
 
@@ -862,6 +1059,7 @@ hammer2_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct inode *inode = file_inode(iocb->ki_filp);
 	hammer2_inode_t *ip = VTOI(inode);
 	hammer2_pfs_t *pmp = ip->pmp;
+	struct timespec64 ts;
 	uint64_t mtime;
 	ssize_t ret;
 
@@ -878,8 +1076,20 @@ hammer2_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		hammer2_update_time(&mtime);
 		hammer2_inode_modify(ip);
 		ip->meta.mtime = mtime;
+		ip->meta.ctime = mtime;
 		hammer2_mtx_unlock(&ip->lock);
 		hammer2_trans_done(pmp, HAMMER2_TRANS_SIDEQ);
+		/*
+		 * Mirror the times into the VFS inode, from the SAME value.  stat()
+		 * reads the VFS inode (generic_fillattr), so updating only ip->meta
+		 * left a stale mtime/ctime visible until the inode was re-read 
+		 * which then looked like the times had spontaneously changed across a
+		 * remount.  Also broke relatime: the VFS saw mtime slightly OLDER
+		 * than atime, so atime was never updated on read.  (generic/003)
+		 */
+		hammer2_time_to_timespec(mtime, &ts);
+		inode_set_mtime_to_ts(inode, ts);
+		inode_set_ctime_to_ts(inode, ts);
 	}
 	return ret;
 }
@@ -905,7 +1115,7 @@ hammer2_create_obj(struct inode *dir, struct dentry *dentry, umode_t mode,
 
 	if (pmp->rdonly || (pmp->flags & HAMMER2_PMPF_EMERG))
 		return ERR_PTR(-EROFS);
-	if (dentry->d_name.len > HAMMER2_INODE_MAXNAME)
+	if (dentry->d_name.len > HAMMER2_NAME_MAX)
 		return ERR_PTR(-ENAMETOOLONG);
 
 	/*
@@ -915,6 +1125,18 @@ hammer2_create_obj(struct inode *dir, struct dentry *dentry, umode_t mode,
 	memset(&cred, 0, sizeof(cred));
 	cred.uid = from_kuid(&init_user_ns, current_fsuid());
 	cred.gid = from_kgid(&init_user_ns, current_fsgid());
+
+	/*
+	 * SGID inheritance, as inode_init_owner() would do it: a new entry in a
+	 * setgid directory takes the directory's group, and a new SUBDIRECTORY
+	 * also inherits the setgid bit itself.  Without this, xfstests
+	 * generic/314 sees drwxr-xr-x where drwxr-sr-x is required.
+	 */
+	if (dir->i_mode & S_ISGID) {
+		cred.gid = from_kgid(&init_user_ns, dir->i_gid);
+		if (S_ISDIR(mode))
+			mode |= S_ISGID;
+	}
 
 	memset(&va, 0, sizeof(va));
 	va.va_type = hammer2_ifmt_to_dtype(mode);
@@ -969,7 +1191,7 @@ hammer2_create_obj(struct inode *dir, struct dentry *dentry, umode_t mode,
 
 			memcpy(blk, symlink_target, tlen);
 			hammer2_trans_init(pmp, HAMMER2_TRANS_BUFCACHE);
-			hammer2_strategy_block(inode, 0, blk, BIO_WRITE);
+			hammer2_strategy_block(inode, 0, blk, BIO_WRITE, 0);
 			hammer2_trans_done(pmp, HAMMER2_TRANS_BUFCACHE);
 			kfree(blk);
 			i_size_write(inode, tlen);
@@ -1058,6 +1280,8 @@ hammer2_link(struct dentry *old_dentry, struct inode *dir,
 
 	if (pmp->rdonly || (pmp->flags & HAMMER2_PMPF_EMERG))
 		return -EROFS;
+	if (dentry->d_name.len > HAMMER2_NAME_MAX)
+		return -ENAMETOOLONG;
 	if (ip->meta.nlinks >= HAMMER2_LINK_MAX)
 		return -EMLINK;
 
@@ -1083,6 +1307,8 @@ hammer2_link(struct dentry *old_dentry, struct inode *dir,
 	if (error == 0) {
 		inc_nlink(inode);
 		inode_set_ctime_current(inode);
+		/* The directory gained an entry: refresh its VFS times too. */
+		inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 		ihold(inode);
 		d_instantiate(dentry, inode);
 	}
@@ -1185,6 +1411,10 @@ hammer2_rename(struct mnt_idmap *idmap, struct inode *fdir,
 		return -EINVAL;
 	if (pmp->rdonly || (pmp->flags & HAMMER2_PMPF_EMERG))
 		return -EROFS;
+	/* The target name is new; the source already exists so it is in range. */
+	if (tdentry->d_name.len > HAMMER2_NAME_MAX ||
+	    fdentry->d_name.len > HAMMER2_NAME_MAX)
+		return -ENAMETOOLONG;
 
 	hammer2_trans_init(pmp, 0);
 	hammer2_inode_ref(fip);
@@ -1253,13 +1483,38 @@ hammer2_rename(struct mnt_idmap *idmap, struct inode *fdir,
 
 	if (error == 0) {
 		hammer2_update_time(&mtime);
+		/*
+		 * POSIX: rename() updates the ctime of the renamed file and the
+		 * mtime AND ctime of both parent directories.  Only the two mtimes
+		 * were being set, and nothing refreshed the VFS inodes, so stat()
+		 * kept reporting the old values.  fstest rename/23.t.
+		 */
+		hammer2_inode_modify(fip);
+		fip->meta.ctime = mtime;
+		/*
+		 * If the rename replaced an existing file, that inode just lost a
+		 * link, so its ctime changes too observable through any other
+		 * link to it.  fstest rename/23.t.
+		 */
+		if (tip) {
+			hammer2_inode_modify(tip);
+			tip->meta.ctime = mtime;
+			if (d_inode(tdentry))
+				inode_set_ctime_current(d_inode(tdentry));
+		}
 		hammer2_inode_modify(fdip);
 		fdip->meta.mtime = mtime;
+		fdip->meta.ctime = mtime;
 		if (fip->meta.type == HAMMER2_OBJTYPE_DIRECTORY &&
 		    fdip->meta.nlinks != 1)
 			--fdip->meta.nlinks;
 		hammer2_inode_modify(tdip);
 		tdip->meta.mtime = mtime;
+		tdip->meta.ctime = mtime;
+		inode_set_ctime_current(d_inode(fdentry));
+		inode_set_mtime_to_ts(fdir, inode_set_ctime_current(fdir));
+		if (fdir != tdir)
+			inode_set_mtime_to_ts(tdir, inode_set_ctime_current(tdir));
 		if (fip->meta.type == HAMMER2_OBJTYPE_DIRECTORY &&
 		    tdip->meta.nlinks != 1)
 			++tdip->meta.nlinks;
@@ -1295,6 +1550,43 @@ hammer2_rename(struct mnt_idmap *idmap, struct inode *fdir,
 /* fsync								    */
 /* ------------------------------------------------------------------------ */
 
+/*
+ * Force this filesystem's device buffers all the way to media.
+ *
+ * hammer2_dev_bwrite() finishes with mark_buffer_dirty(): the data is only in
+ * the block device's page cache, not on the platter.  fsync() therefore
+ * returned success while a power failure still lost the data which is what
+ * the xfstests crash/log-replay tests (generic/034, 056, 065, 073, 090, 101,
+ * 104, 106, 107, 321, 322, 325, 335, 336 ...) were all detecting.
+ */
+static int
+hammer2_flush_devices(hammer2_pfs_t *pmp)
+{
+	hammer2_dev_t *hmp;
+	struct block_device *bdev;
+	int i, j, error = 0, e;
+
+	for (i = 0; i < HAMMER2_MAXCLUSTER; ++i) {
+		hmp = pmp->pfs_hmps[i];
+		if (hmp == NULL)
+			continue;
+		for (j = 0; j < hmp->nvolumes; ++j) {
+			if (hmp->volumes[j].dev == NULL)
+				continue;
+			bdev = hmp->volumes[j].dev->bdev;
+			if (bdev == NULL)
+				continue;
+			e = sync_blockdev(bdev);
+			if (e && error == 0)
+				error = e;
+			e = blkdev_issue_flush(bdev);
+			if (e && error == 0)
+				error = e;
+		}
+	}
+	return error;
+}
+
 static int
 hammer2_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 {
@@ -1316,6 +1608,18 @@ hammer2_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 		error = error2;
 	hammer2_inode_unlock(ip);
 	hammer2_trans_done(ip->pmp, 0);
+
+	/*
+	 * inode's chains are now consistent, but the topology only becomes
+	 * reachable once the volume header is rewritten, and none of it is on
+	 * media until the device buffers are pushed out.  Do both with the
+	 * inode lock DROPPED hammer2_vfs_sync_pmp() takes inode locks and
+	 * deadlocks if called while holding one.
+	 */
+	if (error == 0 && hammer2_fsync_durable) {
+		hammer2_vfs_sync_pmp(ip->pmp, MNT_WAIT);
+		return -hammer2_flush_devices(ip->pmp);
+	}
 
 	return -hammer2_error_to_errno(error);
 }
@@ -1379,7 +1683,7 @@ hammer2_linux_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
 	struct super_block *sb = dentry->d_sb;
 	hammer2_pfs_t *pmp = sb->s_fs_info;
-	struct h2statfs *h2;		/* ~2KB -- keep off the kernel stack */
+	struct h2statfs *h2;		/* ~2KB keep off the kernel stack */
 	int error;
 
 	h2 = kzalloc(sizeof(*h2), GFP_KERNEL);
@@ -1416,7 +1720,7 @@ hammer2_linux_statfs(struct dentry *dentry, struct kstatfs *buf)
 			buf->f_bavail = 0;
 	}
 	buf->f_ffree = h2->f_ffree;
-	buf->f_namelen = HAMMER2_INODE_MAXNAME;
+	buf->f_namelen = HAMMER2_NAME_MAX;
 	kfree(h2);
 	return 0;
 }
@@ -1425,8 +1729,12 @@ static int
 hammer2_sync_fs(struct super_block *sb, int wait)
 {
 	hammer2_pfs_t *pmp = sb->s_fs_info;
+	int error;
 
-	return -hammer2_sync(pmp->mp, wait ? MNT_WAIT : MNT_NOWAIT);
+	error = hammer2_sync(pmp->mp, wait ? MNT_WAIT : MNT_NOWAIT);
+	if (error == 0 && wait && hammer2_fsync_durable)
+		error = hammer2_flush_devices(pmp);
+	return -error;
 }
 
 static void
@@ -1484,7 +1792,63 @@ static const struct super_operations hammer2_super_ops = {
 /* Operation vectors							    */
 /* ------------------------------------------------------------------------ */
 
+/*
+ * ->update_time: capture VFS-side timestamp updates into ip->meta.
+ *
+ * VFS updates inode->i_atime itself (touch_atime -> generic_update_time)
+ * and, with no ->update_time here, nothing ever wrote that back to ip->meta.
+ * stat() therefore reported the new atime until the inode was re-read, at
+ * which point it reverted to the on-media value xfstests generic/003 sees
+ * that as "access time has changed after remount".  The same gap let atime
+ * appear to change on a READ-ONLY mount, where nothing should change at all.
+ */
+static int
+hammer2_update_time_op(struct inode *inode, enum fs_update_time type,
+    unsigned int flags)
+{
+	hammer2_inode_t *ip = VTOI(inode);
+	hammer2_pfs_t *pmp = ip->pmp;
+	struct timespec64 ts;
+
+	if (pmp == NULL || pmp->rdonly || (pmp->flags & HAMMER2_PMPF_EMERG))
+		return 0;
+
+	generic_update_time(inode, type, flags);
+
+	/*
+	 * Deliberately NO transaction here.  This runs on essentially every
+	 * read (atime), and wrapping each one in hammer2_trans_init/done cost
+	 * enough to turn a 1-minute xfstest into a 30-minute one.
+	 * hammer2_inode_modify() only sets INODE_MODIFIED and queues the inode
+	 * on SIDEQ, which needs no transaction; the next sync persists it.
+	 */
+	/*
+	 * Best-effort: TRY the inode lock.  This runs on nearly every read, and
+	 * taking ip->lock exclusively there serialized concurrent readers badly
+	 * enough to stretch one xfstest past 30 minutes.  If another thread holds
+	 * the inode we simply skip persisting this atime the VFS inode already
+	 * has it, and atime is advisory.
+	 */
+	if (hammer2_mtx_ex_try(&ip->lock) != 0)
+		return 0;
+	hammer2_inode_modify(ip);
+	/* 7.1 collapsed the S_* mask into enum fs_update_time. */
+	if (type == FS_UPD_ATIME) {
+		ts = inode_get_atime(inode);
+		ip->meta.atime = hammer2_timespec_to_time(&ts);
+	} else {
+		ts = inode_get_mtime(inode);
+		ip->meta.mtime = hammer2_timespec_to_time(&ts);
+		ts = inode_get_ctime(inode);
+		ip->meta.ctime = hammer2_timespec_to_time(&ts);
+	}
+	hammer2_mtx_unlock(&ip->lock);
+
+	return 0;
+}
+
 static const struct inode_operations hammer2_dir_iops = {
+	.update_time	= hammer2_update_time_op,
 	.lookup		= hammer2_lookup,
 	.create		= hammer2_create,
 	.link		= hammer2_link,
@@ -1499,17 +1863,20 @@ static const struct inode_operations hammer2_dir_iops = {
 };
 
 static const struct inode_operations hammer2_file_iops = {
+	.update_time	= hammer2_update_time_op,
 	.getattr	= hammer2_getattr,
 	.setattr	= hammer2_setattr,
 };
 
 static const struct inode_operations hammer2_symlink_iops = {
+	.update_time	= hammer2_update_time_op,
 	.get_link	= hammer2_get_link,
 	.getattr	= hammer2_getattr,
 	.setattr	= hammer2_setattr,
 };
 
 static const struct inode_operations hammer2_special_iops = {
+	.update_time	= hammer2_update_time_op,
 	.getattr	= hammer2_getattr,
 	.setattr	= hammer2_setattr,
 };
@@ -1529,6 +1896,13 @@ static const struct file_operations hammer2_file_fops = {
 	.write_iter	= hammer2_write_iter,
 	.mmap		= generic_file_mmap,
 	.fsync		= hammer2_fsync,
+	/*
+	 * Without these, sendfile(2)/splice(2) fail outright (xfstests
+	 * generic/249).  The generic helpers are correct for a page-cache
+	 * filesystem using generic_file_read_iter/write_iter.
+	 */
+	.splice_read	= filemap_splice_read,
+	.splice_write	= iter_file_splice_write,
 	.unlocked_ioctl	= hammer2_unlocked_ioctl,
 	.compat_ioctl	= compat_ptr_ioctl,
 };
@@ -1539,6 +1913,13 @@ static const struct address_space_operations hammer2_aops = {
 	.write_begin	= hammer2_write_begin,
 	.write_end	= hammer2_write_end,
 	.dirty_folio	= filemap_dirty_folio,
+	/*
+	 * Without this the kernel warns "hammer2_aops does not implement
+	 * migrate_folio" and page migration fails, so memory compaction cannot
+	 * move these pages.  filemap_migrate_folio() is the correct generic
+	 * implementation for a filesystem whose folios carry no private data.
+	 */
+	.migrate_folio	= filemap_migrate_folio,
 };
 
 /* ------------------------------------------------------------------------ */
@@ -1622,7 +2003,7 @@ hammer2_fill_super(struct super_block *sb, struct fs_context *fc)
 	 * unmount (inode size still commits via the chain path, but the data
 	 * blocks read back as zero after remount).  With a real bdi, sync(2) and
 	 * unmount flush dirty folios through hammer2_writepages() -> the data
-	 * chains -- before hammer2_sync_fs() commits them to the volume header.
+	 * chains before hammer2_sync_fs() commits them to the volume header.
 	 */
 	error = super_setup_bdi(sb);
 	if (error)

@@ -1385,9 +1385,25 @@ hammer2_xop_inode_chain_sync(hammer2_xop_t *arg, void *scratch, int clindex)
 		error = hammer2_chain_modify(parent, xop->head.mtid, 0, 0);
 		if (error == 0) {
 			parent->data->ipdata.meta = xop->meta;
-			if (xop->clear_directdata)
+			if (xop->clear_directdata) {
 				bzero(&parent->data->ipdata.u.blockset,
 				    sizeof(parent->data->ipdata.u.blockset));
+			} else if ((xop->ipflags & HAMMER2_INODE_RESIZED) &&
+			    (xop->meta.op_flags & HAMMER2_OPFLAG_DIRECTDATA) &&
+			    xop->meta.size < HAMMER2_EMBEDDED_BYTES) {
+				/*
+				 * Resize of a file whose data is embedded in the inode.
+				 * Nothing zeroed the bytes past the new EOF, so truncating
+				 * an inline file down and extending it again handed back the
+				 * OLD contents instead of zeros (xfstests generic/393:
+				 * write 40 x 'X', truncate 0, truncate 50 -> the X's return).
+				 *
+				 * Only safe while DIRECTDATA is still set: once it is cleared
+				 * the same union holds the blockref table (handled above).
+				 */
+				bzero(parent->data->ipdata.u.data + xop->meta.size,
+				    HAMMER2_EMBEDDED_BYTES - xop->meta.size);
+			}
 		}
 	}
 done:

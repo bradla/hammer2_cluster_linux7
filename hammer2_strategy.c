@@ -284,7 +284,7 @@ hammer2_strategy_read_completion(hammer2_chain_t *focus, const char *data,
 	} else if (focus->bref.type == HAMMER2_BREF_TYPE_DATA) {
 		/*
 		 * Data is on-media, record for live dedup.  Release the
-		 * chain (try to free it) when done.  The data is still
+		 * chain (try to free it) when done.  data is still
 		 * cached by both the buffer cache in front and the
 		 * block device behind us.
 		 *
@@ -348,10 +348,22 @@ hammer2_strategy_write(struct vop_strategy_args *ap)
 	hammer2_trans_init(pmp, HAMMER2_TRANS_BUFCACHE);
 
 	xop = hammer2_xop_alloc(ip,
-	    HAMMER2_XOP_MODIFYING | HAMMER2_XOP_STRATEGY);
+	    HAMMER2_XOP_MODIFYING | HAMMER2_XOP_STRATEGY |
+	    ((bp->b_flags & B_NOWAIT) ? HAMMER2_XOP_NONBLOCK : 0));
 	xop->bp = bp;
 	xop->lbase = bp->b_offset;
 	hammer2_xop_start(&xop->head, &hammer2_strategy_write_desc);
+
+	/*
+	 * B_NOWAIT and the per-inode XOP interlock was busy, so the body never
+	 * ran and nothing completed the buf.  Report EAGAIN; the caller
+	 * (background writeback) redirties the folio and comes back later.
+	 */
+	if (xop->head.flags & HAMMER2_XOP_ABORTED) {
+		bp->b_error = EAGAIN;
+		bp->b_ioflags |= BIO_ERROR;
+		bufdone(bp);
+	}
 	hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
 
 	return (0);
@@ -453,7 +465,7 @@ hammer2_assign_physical(hammer2_inode_t *ip, hammer2_chain_t **parentp,
 	chain = hammer2_chain_lookup(parentp, &key_dummy, lbase, lbase, errorp,
 	    HAMMER2_LOOKUP_NODATA);
 	/*
-	 * The lookup code should not return a DELETED chain to us, unless
+	 * lookup code should not return a DELETED chain to us, unless
 	 * its a short-file embedded in the inode.  Then it is possible for
 	 * the lookup to return a deleted inode.
 	 */
@@ -485,7 +497,7 @@ hammer2_assign_physical(hammer2_inode_t *ip, hammer2_chain_t **parentp,
 		switch (chain->bref.type) {
 		case HAMMER2_BREF_TYPE_INODE:
 			/*
-			 * The data is embedded in the inode, which requires
+			 * data is embedded in the inode, which requires
 			 * a bit more finess.
 			 */
 			*errorp |= hammer2_chain_modify_ip(ip, chain, mtid, 0);
@@ -522,7 +534,7 @@ failed:
 }
 
 /*
- * The core write function which determines which path to take
+ * core write function which determines which path to take
  * depending on compression settings.  We also have to locate the
  * related chains so we can calculate and set the check data for
  * the blockref.
@@ -546,7 +558,7 @@ hammer2_write_file_core(char *data, hammer2_inode_t *ip,
 		 * in the strategy code later.
 		 *
 		 * This can return NOOFFSET for inode-embedded data.
-		 * The strategy code will take care of it in that case.
+		 * strategy code will take care of it in that case.
 		 */
 		bdata = data;
 		chain = hammer2_assign_physical(ip, parentp, lbase, pblksize,
@@ -592,7 +604,7 @@ hammer2_write_file_core(char *data, hammer2_inode_t *ip,
 
 /*
  * Generic function that will perform the compression in compression
- * write path. The compression algorithm is determined by the settings
+ * write path. compression algorithm is determined by the settings
  * obtained from inode.
  */
 static void
@@ -645,7 +657,7 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 			 * doesn't do it for us.  Add the related
 			 * overhead.
 			 *
-			 * NOTE: The LZ4 code seems to assume at least an
+			 * NOTE: LZ4 code seems to assume at least an
 			 *	 8-byte buffer size granularity and may
 			 *	 overrun the buffer if given a 4-byte
 			 *	 granularity.
@@ -784,6 +796,9 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 				break;
 			}
 			bdata = hammer2_io_data(dio, chain->bref.data_off);
+			/* See hammer2_write_bp(): the dio buffer must not be
+			 * modified while hammer2_io_putblk() may be writing it. */
+			hammer2_mtx_ex(&dio->lock);
 			/*
 			 * When loading the block make sure we don't
 			 * leave garbage after the compressed data.
@@ -800,11 +815,12 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 				bcopy(data, bdata, pblksize);
 			}
 			/*
-			 * The flush code doesn't calculate check codes for
+			 * flush code doesn't calculate check codes for
 			 * file data (doing so can result in excessive I/O),
 			 * so we do it here.
 			 */
 			hammer2_chain_setcheck(chain, bdata);
+			hammer2_mtx_unlock(&dio->lock);
 			/*
 			 * Device buffer is now valid, chain is no longer in
 			 * the initial state.
@@ -969,13 +985,29 @@ hammer2_write_bp(hammer2_chain_t *chain, char *data, int ioflag, int pblksize,
 		chain->bref.methods =
 		    HAMMER2_ENC_COMP(HAMMER2_COMP_NONE) +
 		    HAMMER2_ENC_CHECK(check_algo);
+		/*
+		 * Hold dio->lock across the copy AND the check-code calculation.
+		 *
+		 * hammer2_io_getblk() drops dio->lock before returning, so without
+		 * this the buffer is modified with no lock held while
+		 * hammer2_io_putblk() may be writing that very buffer to the device
+		 * (it holds the lock, but we did not).  The result is a torn 64KiB
+		 * block on media: leading pages are the new data and the rest is
+		 * whatever occupied the block before observed as pages 0-5 of one
+		 * file followed by pages 6-15 of another.  The check code is computed
+		 * from the complete in-memory copy so it is correct and the read
+		 * fails with HAMMER2_ERROR_CHECK (EIO) rather than returning the
+		 * corrupt bytes.
+		 */
+		hammer2_mtx_ex(&dio->lock);
 		bcopy(data, bdata, chain->bytes);
 		/*
-		 * The flush code doesn't calculate check codes for
+		 * flush code doesn't calculate check codes for
 		 * file data (doing so can result in excessive I/O),
 		 * so we do it here.
 		 */
 		hammer2_chain_setcheck(chain, bdata);
+		hammer2_mtx_unlock(&dio->lock);
 		/*
 		 * Device buffer is now valid, chain is no longer in
 		 * the initial state.

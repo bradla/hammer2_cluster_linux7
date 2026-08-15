@@ -46,7 +46,7 @@
 #include <linux/types.h>
 #include <linux/limits.h>
 
-/* C99 stdint.h limits -- not always present in kernel headers. */
+/* C99 stdint.h limits not always present in kernel headers. */
 #ifndef UINT32_MAX
 #define UINT32_MAX	(0xffffffffU)
 #endif
@@ -221,7 +221,7 @@ static inline unsigned long *hashinit(int elements, void *type,
 	struct list_head *t = kzalloc(sz * sizeof(struct list_head), GFP_KERNEL);
 
 	/*
-	 * Each bucket is a list head and MUST be self-initialized -- a zeroed
+	 * Each bucket is a list head and MUST be self-initialized a zeroed
 	 * list_head (next=prev=NULL) is not a valid empty list, and iterating
 	 * it (list_first_entry_or_null sees next != head) dereferences NULL.
 	 */
@@ -245,11 +245,11 @@ static inline void hashdestroy(void *table, void *type, unsigned long hashmask)
 static inline char *hstrdup(const char *s) { return kstrdup(s, GFP_KERNEL); }
 static inline void hstrfree(char *s)       { kfree(s); }
 
-/* TAILQ_EMPTY shim -- list_empty on the embedded list_head. */
+/* TAILQ_EMPTY shim list_empty on the embedded list_head. */
 #define TAILQ_EMPTY(hp)		list_empty(&(hp)->head)
 
 /*
- * BSD vfs_getopt -- on Linux the mount glue (hammer2_linux_vfs.c) builds a
+ * BSD vfs_getopt on Linux the mount glue (hammer2_linux_vfs.c) builds a
  * small option list in mp->mnt_optnew and points hammer2_mount() at it.  A
  * NULL list degrades to "no options found" (ENOENT) so call sites still
  * compile and behave for the BSD vfsops dispatch path that is never reached.
@@ -291,18 +291,18 @@ static inline int vfs_filteropt(void *opts, const char **legal)
 }
 
 /*
- * MPTOPMP(mp) -- BSD macro that fetches the FS-private hammer2_pfs from a
+ * MPTOPMP(mp) BSD macro that fetches the FS-private hammer2_pfs from a
  * struct mount.  Every caller in this port passes the BSD `struct mount`
  * shim (NOT a super_block), and hammer2_mount_helper() stores the pmp in
- * mp->mnt_data -- so read it from there.  (Casting to super_block and reading
+ * mp->mnt_data read it from there.  (Casting to super_block and reading
  * s_fs_info read past the small struct mount shim and returned garbage/NULL.)
  */
 #define MPTOPMP(mp)	((hammer2_pfs_t *)((struct mount *)(mp))->mnt_data)
 
 /*
- * BSD struct mount stub.  HAMMER2's vfsops reads a handful of fields.
- * On Linux these are spread across struct super_block / file_system_type;
- * this stub lets the code compile -- a real port replaces every call site
+ * BSD struct mount stub. HAMMER2's vfsops reads a handful of fields.
+ * Linux these are spread across struct super_block / file_system_type;
+ * this stub lets the code compile a real port replaces every call site
  * with the proper Linux API.
  */
 /*
@@ -418,7 +418,7 @@ struct fid {
 
 /* ino_t is already typedef'd by <linux/types.h>; no shim needed. */
 
-/* BSD LK_* lock flags used in cleanup paths -- map to no-ops on Linux. */
+/* BSD LK_* lock flags used in cleanup paths map to no-ops on Linux. */
 #ifndef LK_EXCLUSIVE
 #define LK_EXCLUSIVE	0
 #define LK_SHARED	0
@@ -450,7 +450,7 @@ struct lock {
 			down_write(&(lk)->lk_rw);			\
 	} while (0)
 
-/* BSD sleep priority flags -- unused on Linux. */
+/* BSD sleep priority flags unused on Linux. */
 #ifndef PCATCH
 #define PCATCH	0
 #define PRIBIO	0
@@ -515,8 +515,25 @@ struct vfsops {
 #define VSOCK	DT_SOCK
 
 /* DragonFly debug print helpers; map to Linux printk variants. */
-#define hprintf(fmt, ...)		pr_info("hammer2: " fmt, ##__VA_ARGS__)
+/*
+ * hprintf() is rate limited, because almost every call site sits on a path that
+ * runs once per block/chain/inode and so repeats without bound when the failure
+ * is persistent rather than transient.  A single bad freemap leaf logged
+ * which starved
+ * journald, killed sshd and ended in a watchdog reset; rate limiting just that
+ * one site simply moved the storm to the next two messages
+ * from hammer2_chain.c and hammer2_inode.c).  There are ~213 hprintf() call
+ * sites and any of them can be the next one, so the limit belongs in the macro.
+ *
+ * pr_info_ratelimited() keeps a separate budget per call site (10 messages per
+ * 5s by default), so genuinely infrequent messages mount, unmount, one-shot
+ * failures are never suppressed, and a storming site reports itself with
+ * "N callbacks suppressed" instead of taking the machine down.
+ */
+#define hprintf(fmt, ...)		pr_info_ratelimited("hammer2: " fmt, ##__VA_ARGS__)
 #define debug_hprintf(fmt, ...)		pr_debug("hammer2: " fmt, ##__VA_ARGS__)
+/* Retained as an explicit spelling for sites where the storm was observed. */
+#define hprintf_rl(fmt, ...)		pr_info_ratelimited("hammer2: " fmt, ##__VA_ARGS__)
 /*
  * Userspace printf doesn't exist in kernel code; redirect to pr_info() so
  * BSD debug call sites compile and produce dmesg output.
@@ -644,7 +661,7 @@ static inline int priv_check_cred(const struct ucred *cred, int priv)
 #define NODEV		((dev_t)(-1))
 #endif
 
-/* BSD major(dev_t) / minor(dev_t) -- Linux has MAJOR/MINOR via <linux/kdev_t.h> */
+/* BSD major(dev_t) / minor(dev_t) Linux has MAJOR/MINOR via <linux/kdev_t.h> */
 #include <linux/kdev_t.h>
 #ifndef major
 #define major(d)	MAJOR((dev_t)(d))
@@ -659,7 +676,7 @@ static inline int priv_check_cred(const struct ucred *cred, int priv)
 #endif
 
 /* vop_helper_create_uid is defined as a static helper inside
- * hammer2_inode.c -- no global shim needed. */
+ * hammer2_inode.c no global shim needed. */
 
 /* BSD sx-lock asserts.  Linux mutex doesn't distinguish recursion. */
 #ifndef SA_XLOCKED
@@ -707,6 +724,7 @@ struct vop_strategy_args {
 #define B_CLUSTEROK	0x0100
 #define B_INVAL		0x0200
 #define B_RELBUF	0x0400
+#define B_NOWAIT	0x0800	/* strategy: abort rather than block on the XOP interlock */
 
 static inline void bufdone(struct buf *bp) { (void)bp; }
 #define __DECONST(t, v)		((t)(uintptr_t)(v))
@@ -731,7 +749,7 @@ static inline void bufdone(struct buf *bp) { (void)bp; }
  * BSD I/O flag constants for VOP_WRITE / strategy.  IO_SYNC requests
  * synchronous completion; IO_ASYNC is fire-and-forget.  Linux uses the
  * WB_SYNC_* / REQ_SYNC bits, but HAMMER2 only branches on the BSD
- * constants -- so defining them as opaque tokens is enough.
+ * constants so defining them as opaque tokens is enough.
  */
 #ifndef IO_SYNC
 #define IO_SYNC		0x0080
@@ -926,8 +944,8 @@ uma_zfree(uma_zone_t z, void *p)
  *   atomic_set_int(p,v)   == atomic_or  (set the bits in v)
  *   atomic_clear_int(p,v) == atomic_andnot
  *   atomic_cmpset_int     returns a success boolean
- * The earlier (buggy) redefinitions used atomic_set() -- which OVERWRITES the
- * whole word -- so e.g. atomic_set_int(&chain->flags, BIT) clobbered every
+ * The earlier (buggy) redefinitions used atomic_set() which OVERWRITES the
+ * whole word atomic_set_int(&chain->flags, BIT) clobbered every
  * other flag bit, corrupting the CHAIN_IOINPROG interlock and much more.
  */
 

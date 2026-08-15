@@ -250,7 +250,7 @@ hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
 		if (dio == NULL) {
 			/*
 			 * Dedup probe miss (block not currently cached).  Must
-			 * drop iohash_lock before returning -- every other exit
+			 * drop iohash_lock before returning every other exit
 			 * unlocks below; leaking it here wedges the whole FS the
 			 * moment any other thread needs iohash_lock.
 			 */
@@ -272,7 +272,7 @@ hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
 			bzero(hammer2_io_data(dio, lbase), lsize);
 			/* fall through */
 		case HAMMER2_DOP_NEWNZ:
-			dio->refs |= HAMMER2_DIO_DIRTY;
+			atomic_set_32(&dio->refs, HAMMER2_DIO_DIRTY);
 			break;
 		default:
 			break;
@@ -281,8 +281,10 @@ hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
 		return (dio);
 	}
 
-	/* GOOD is not set. */
-	KKASSERT(dio->data == NULL);
+	/*
+	 * GOOD is not set.  dio->data may still be allocated on a cached dio
+	 * whose buffer could not be validated; hammer2_bread() reuses it.
+	 */
 	if (btype == HAMMER2_BREF_TYPE_DATA)
 		hce = hammer2_cluster_data_read;
 	else
@@ -306,7 +308,7 @@ hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
 			}
 			if (op == HAMMER2_DOP_NEW)
 				bzero(dio->data, dio->psize);
-			dio->refs |= HAMMER2_DIO_DIRTY;
+			atomic_set_32(&dio->refs, HAMMER2_DIO_DIRTY);
 			break;
 		default:
 			error = hammer2_bread(hmp, dio, 0, hce);
@@ -320,7 +322,7 @@ hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
 				bzero(hammer2_io_data(dio, lbase), lsize);
 				/* fall through */
 			case HAMMER2_DOP_NEWNZ:
-				dio->refs |= HAMMER2_DIO_DIRTY;
+				atomic_set_32(&dio->refs, HAMMER2_DIO_DIRTY);
 				break;
 			default:
 				break;
@@ -331,7 +333,9 @@ hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
 	/* BUF_KERNPROC is a no-op on Linux; buffer ownership is per-task. */
 	dio->error = error;
 	if (error == 0)
-		dio->refs |= HAMMER2_DIO_GOOD;
+		atomic_set_32(&dio->refs, HAMMER2_DIO_GOOD);
+	else
+		atomic_add_int(&hmp->iofail_count, 1);	/* see hammer2_vfs_sync_pmp() */
 
 	hammer2_mtx_unlock(&dio->lock);
 
@@ -355,6 +359,17 @@ hammer2_io_putblk(hammer2_io_t **diop)
 	int dio_limit, hce;
 
 	dio = *diop;
+	/*
+	 * Tolerate a NULL dio.  Error paths routinely do
+	 *     hammer2_io_t *dio = NULL;
+	 *     if (hammer2_io_new(...)) { hammer2_io_brelse(&dio); ... }
+	 * and every b*() wrapper funnels into here, so an allocation failure
+	 * (ENOSPC in particular) dereferenced NULL and oopsed:
+	 *   BUG: kernel NULL pointer dereference ... hammer2_io_putblk+0x36
+	 *   hammer2_chain_modify <- hammer2_chain_create <- hammer2_freemap_alloc
+	 */
+	if (dio == NULL)
+		return;
 	*diop = NULL;
 
 	hammer2_mtx_ex(&dio->lock);
@@ -369,22 +384,58 @@ hammer2_io_putblk(hammer2_io_t **diop)
 	 * On the 1->0 transition clear DIO_GOOD.
 	 * On any other transition we can return early.
 	 */
-	orefs = dio->refs;
-	if ((dio->refs & HAMMER2_DIO_MASK) == 1) {
-		dio->refs--;
-		/*
-		 * Clear the transient state bits on the 1->0 transition.  dios
-		 * are cached and reused, so leaving a stale FLUSH bit set would
-		 * force the next delayed write (bdwrite) on the reused dio into
-		 * a synchronous write and defeat write batching.  The writeback
-		 * below keys off the captured `orefs`, not the live refs.
-		 */
-		dio->refs &= ~(HAMMER2_DIO_GOOD | HAMMER2_DIO_DIRTY |
-			       HAMMER2_DIO_FLUSH);
-	} else {
-		dio->refs--;
-		hammer2_mtx_unlock(&dio->lock);
-		return;
+	/*
+	 * dio->refs packs the refcount (HAMMER2_DIO_MASK) and the state bits
+	 * (GOOD/DIRTY/FLUSH) into one word, and the state bits are set by
+	 * hammer2_io_setdirty()/bawrite()/bdwrite()/bwrite() using a lock-free
+	 * atomic or those callers hold a dio REF but not dio->lock, because
+	 * hammer2_io_getblk() drops the lock before returning.
+	 *
+	 * So holding dio->lock here does not make a read-modify-write on
+	 * dio->refs safe.  A plain `dio->refs--` reads the word, decrements,
+	 * and writes it back; an atomic OR landing on another CPU inside that
+	 * window is erased:
+	 *
+	 *   A: orefs = refs (0x40000002)
+	 *   B:                              atomic_or(DIRTY) -> 0x50000002
+	 *   A: refs-- writes 0x40000001     <- DIRTY lost
+	 *
+	 * A lost DIRTY bit means the last drop below skips the writeback and
+	 * kvfree()s the buffer, so the modification never reaches media
+	 * while hammer2_chain_setcheck() has already hashed the in-memory
+	 * version into the parent blockref.  Next read of that block then
+	 * fails its check code (HAMMER2_ERROR_CHECK -> EDOM), which is
+	 * indistinguishable from media corruption but is purely a lost update.
+	 *
+	 * Use cmpset so the decrement and the transient-bit clear happen as one
+	 * atomic step against those ORs.
+	 */
+	for (;;) {
+		orefs = dio->refs;
+		KKASSERT((orefs & HAMMER2_DIO_MASK) != 0);
+		if ((orefs & HAMMER2_DIO_MASK) == 1) {
+			/*
+			 * Last drop.  Clear the transient state bits: dios are
+			 * cached and reused, and a stale FLUSH bit would force
+			 * the next bdwrite() on the reused dio into a
+			 * synchronous write, defeating write batching.  The
+			 * writeback below keys off the captured `orefs`, not
+			 * the live refs.
+			 */
+			/*
+			 * DIO_GOOD stays SET: the buffer is still valid and is kept
+			 * for reuse (see below).  Only the write-intent bits go.
+			 */
+			if (atomic_cmpset_32(&dio->refs, orefs,
+			    (orefs - 1) & ~(HAMMER2_DIO_DIRTY |
+					    HAMMER2_DIO_FLUSH)))
+				break;
+		} else {
+			if (atomic_cmpset_32(&dio->refs, orefs, orefs - 1)) {
+				hammer2_mtx_unlock(&dio->lock);
+				return;
+			}
+		}
 	}
 
 	/* Lastdrop (1->0 transition) case. */
@@ -410,15 +461,25 @@ hammer2_io_putblk(hammer2_io_t **diop)
 			    dio->psize);
 		}
 	}
-	if (dio->data) {
-		kvfree(dio->data);
-		dio->data = NULL;
-	}
+	/*
+	 * Keep the 64KiB buffer cached rather than freeing it here.
+	 *
+	 * Freeing on every last drop meant the next access to this block re-read
+	 * all 64KiB from the device and memcpy'd it into a fresh allocation, even
+	 * though the data was still valid.  Metadata-heavy work (directory scans
+	 * especially) revisits the same blocks constantly with the refcount
+	 * dropping to zero in between, so it paid that cost repeatedly.
+	 *
+	 * hammer2_io_hash_cleanup() already frees dio->data when it evicts a dio
+	 * and is driven by hammer2_dio_limit, so the cache is bounded at about
+	 * dio_limit * 64KiB (2048 * 64KiB = 128MiB by default here).
+	 */
+	if (dio->data == NULL)
+		atomic_clear_32(&dio->refs, HAMMER2_DIO_GOOD);
 
 	/* Update iofree_count before disposing of the dio. */
 	atomic_add_int(&hmp->iofree_count, 1);
 
-	KKASSERT(!(dio->refs & HAMMER2_DIO_GOOD));
 	hammer2_mtx_unlock(&dio->lock);
 	/* Another process may come in and get/put this dio. */
 
@@ -561,7 +622,8 @@ hammer2_io_hash_lookup(hammer2_dev_t *hmp, hammer2_off_t pbase, uint64_t *refsp)
 	for (dio = hash->base; dio; dio = dio->next) {
 		if (dio->pbase == pbase) {
 			hammer2_mtx_ex(&dio->lock);
-			refs = dio->refs++;
+			/* Atomic: races with the lock-free ORs in io_setdirty() etc. */
+			refs = (uint32_t)atomic_fetchadd_32(&dio->refs, 1);
 			if ((refs & HAMMER2_DIO_MASK) == 0)
 				atomic_add_int(&dio->hmp->iofree_count, -1);
 			if (refsp)

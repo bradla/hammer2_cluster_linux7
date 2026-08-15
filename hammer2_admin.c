@@ -264,6 +264,24 @@ again:
 	hammer2_lk_unlock(mtx);
 }
 
+/*
+ * Non-blocking variant: returns 0 if the interlock was acquired, 1 on
+ * collision (another XOP is in flight against this inode).
+ */
+static int
+hammer2_xop_testset_ipdep_try(hammer2_inode_t *ip)
+{
+	hammer2_pfs_t *pmp = ip->pmp;
+	hammer2_lk_t *mtx = &pmp->xop_lock[ip->ipdep_idx];
+	int collision;
+
+	hammer2_lk_ex(mtx);
+	collision = xop_testset_ipdep(ip, ip->ipdep_idx);
+	hammer2_lk_unlock(mtx);
+
+	return (collision);
+}
+
 static void
 hammer2_xop_unset_ipdep(hammer2_inode_t *ip)
 {
@@ -291,8 +309,8 @@ hammer2_xop_unset_ipdep(hammer2_inode_t *ip)
 	 *
 	 * Thread A then sleeps forever in TASK_UNINTERRUPTIBLE, holding whatever
 	 * it holds, and everything behind it piles up on page locks.  Worse, the
-	 * flag is read/modified under mtx = xop_lock[ipdep_idx] -- a DIFFERENT
-	 * lock per index -- so the accesses are not even mutually excluded.
+	 * flag is read/modified under mtx = xop_lock[ipdep_idx] a DIFFERENT
+	 * lock per index so the accesses are not even mutually excluded.
 	 *
 	 * Observed on Linux booting a real systemd userland: ~26 tasks stuck in D
 	 * state, one in hammer2_xop_testset_ipdep and the rest blocked behind it
@@ -358,13 +376,71 @@ hammer2_xop_start(hammer2_xop_head_t *xop, hammer2_xop_desc_t *desc)
 		}
 
 		if (hammer2_xop_active(xop)) {
-			hammer2_xop_testset_ipdep(ip);
-			if (xop->ip2)
-				hammer2_xop_testset_ipdep(xop->ip2);
-			if (xop->ip3 && xop->ip3 != xop->ip1) /* rename */
-				hammer2_xop_testset_ipdep(xop->ip3);
-			if (xop->ip4 && xop->ip4 != xop->ip2) /* rename */
-				hammer2_xop_testset_ipdep(xop->ip4);
+			/*
+			 * NONBLOCK callers (background writeback) must not sleep
+			 * here.  hammer2_writepages() marks the folio under
+			 * writeback and holds a BUFCACHE transaction across this
+			 * call, so blocking on an interlock held by a thread that
+			 * is itself waiting on that folio or on the flush
+			 * transaction deadlocks observed as
+			 * kworker/uN+flush-hammer2 parked in
+			 * hammer2_xop_testset_ipdep under writeback_sb_inodes.
+			 *
+			 * Abort instead: hammer2_strategy_write() completes the buf
+			 * with EAGAIN and writeback redirties and retries later.
+			 *
+			 * Interlocks taken before the collision are released here,
+			 * and ABORTED tells hammer2_xop_retire() not to release any
+			 * xop_unset_ipdep() removes the inode whichever XOP put
+			 * it on the list, so an unmatched unset would drop somebody
+			 * else's interlock while their XOP is still running.
+			 */
+			if (xop->flags & HAMMER2_XOP_NONBLOCK) {
+				hammer2_inode_t *got2 = NULL, *got3 = NULL;
+				int collision, got1;
+
+				collision = hammer2_xop_testset_ipdep_try(ip);
+				got1 = !collision;
+				if (!collision && xop->ip2) {
+					collision = hammer2_xop_testset_ipdep_try(xop->ip2);
+					if (!collision)
+						got2 = xop->ip2;
+				}
+				if (!collision && xop->ip3 && xop->ip3 != xop->ip1) {
+					collision = hammer2_xop_testset_ipdep_try(xop->ip3);
+					if (!collision)
+						got3 = xop->ip3;
+				}
+				if (!collision && xop->ip4 && xop->ip4 != xop->ip2)
+					collision = hammer2_xop_testset_ipdep_try(xop->ip4);
+				if (collision) {
+					if (got3)
+						hammer2_xop_unset_ipdep(got3);
+					if (got2)
+						hammer2_xop_unset_ipdep(got2);
+					/*
+					 * ONLY if we actually took it.  If the collision was
+					 * on ip itself we never inserted an entry, and
+					 * xop_unset_ipdep() removes by inode, not by owner 
+					 * so an unconditional release here would strip the
+					 * interlock out from under the XOP that holds it.
+					 */
+					if (got1)
+						hammer2_xop_unset_ipdep(ip);
+					xop->flags |= HAMMER2_XOP_ABORTED;
+					hammer2_xop_feed(xop, NULL, i, EAGAIN);
+					hammer2_xop_retire(xop, mask);
+					continue;
+				}
+			} else {
+				hammer2_xop_testset_ipdep(ip);
+				if (xop->ip2)
+					hammer2_xop_testset_ipdep(xop->ip2);
+				if (xop->ip3 && xop->ip3 != xop->ip1) /* rename */
+					hammer2_xop_testset_ipdep(xop->ip3);
+				if (xop->ip4 && xop->ip4 != xop->ip2) /* rename */
+					hammer2_xop_testset_ipdep(xop->ip4);
+			}
 			xop_storage_func(xop, ip, xop->scratch, i);
 			hammer2_xop_retire(xop, mask);
 		} else {
@@ -410,13 +486,71 @@ hammer2_xop_start_except(hammer2_xop_head_t *xop, hammer2_xop_desc_t *desc,
 		}
 
 		if (hammer2_xop_active(xop)) {
-			hammer2_xop_testset_ipdep(ip);
-			if (xop->ip2)
-				hammer2_xop_testset_ipdep(xop->ip2);
-			if (xop->ip3 && xop->ip3 != xop->ip1) /* rename */
-				hammer2_xop_testset_ipdep(xop->ip3);
-			if (xop->ip4 && xop->ip4 != xop->ip2) /* rename */
-				hammer2_xop_testset_ipdep(xop->ip4);
+			/*
+			 * NONBLOCK callers (background writeback) must not sleep
+			 * here.  hammer2_writepages() marks the folio under
+			 * writeback and holds a BUFCACHE transaction across this
+			 * call, so blocking on an interlock held by a thread that
+			 * is itself waiting on that folio or on the flush
+			 * transaction deadlocks observed as
+			 * kworker/uN+flush-hammer2 parked in
+			 * hammer2_xop_testset_ipdep under writeback_sb_inodes.
+			 *
+			 * Abort instead: hammer2_strategy_write() completes the buf
+			 * with EAGAIN and writeback redirties and retries later.
+			 *
+			 * Interlocks taken before the collision are released here,
+			 * and ABORTED tells hammer2_xop_retire() not to release any
+			 * xop_unset_ipdep() removes the inode whichever XOP put
+			 * it on the list, so an unmatched unset would drop somebody
+			 * else's interlock while their XOP is still running.
+			 */
+			if (xop->flags & HAMMER2_XOP_NONBLOCK) {
+				hammer2_inode_t *got2 = NULL, *got3 = NULL;
+				int collision, got1;
+
+				collision = hammer2_xop_testset_ipdep_try(ip);
+				got1 = !collision;
+				if (!collision && xop->ip2) {
+					collision = hammer2_xop_testset_ipdep_try(xop->ip2);
+					if (!collision)
+						got2 = xop->ip2;
+				}
+				if (!collision && xop->ip3 && xop->ip3 != xop->ip1) {
+					collision = hammer2_xop_testset_ipdep_try(xop->ip3);
+					if (!collision)
+						got3 = xop->ip3;
+				}
+				if (!collision && xop->ip4 && xop->ip4 != xop->ip2)
+					collision = hammer2_xop_testset_ipdep_try(xop->ip4);
+				if (collision) {
+					if (got3)
+						hammer2_xop_unset_ipdep(got3);
+					if (got2)
+						hammer2_xop_unset_ipdep(got2);
+					/*
+					 * ONLY if we actually took it.  If the collision was
+					 * on ip itself we never inserted an entry, and
+					 * xop_unset_ipdep() removes by inode, not by owner 
+					 * so an unconditional release here would strip the
+					 * interlock out from under the XOP that holds it.
+					 */
+					if (got1)
+						hammer2_xop_unset_ipdep(ip);
+					xop->flags |= HAMMER2_XOP_ABORTED;
+					hammer2_xop_feed(xop, NULL, i, EAGAIN);
+					hammer2_xop_retire(xop, mask);
+					continue;
+				}
+			} else {
+				hammer2_xop_testset_ipdep(ip);
+				if (xop->ip2)
+					hammer2_xop_testset_ipdep(xop->ip2);
+				if (xop->ip3 && xop->ip3 != xop->ip1) /* rename */
+					hammer2_xop_testset_ipdep(xop->ip3);
+				if (xop->ip4 && xop->ip4 != xop->ip2) /* rename */
+					hammer2_xop_testset_ipdep(xop->ip4);
+			}
 			xop_storage_func(xop, ip, xop->scratch, i);
 			hammer2_xop_retire(xop, mask);
 		} else {
@@ -516,7 +650,19 @@ hammer2_xop_retire(hammer2_xop_head_t *xop, uint32_t mask)
 		mask &= ~(1U << i);
 	}
 
-	/* The inode is only held at this point, simply drop it. */
+	/*
+	 * The inode is only held at this point, simply drop it.
+	 *
+	 * ABORTED means xop_start already released the interlocks after a
+	 * NONBLOCK collision; releasing again would remove entries that
+	 * belong to whichever XOP actually holds them.
+	 */
+	if (xop->flags & HAMMER2_XOP_ABORTED) {
+		if (xop->ip1) { hammer2_inode_drop(xop->ip1); xop->ip1 = NULL; }
+		if (xop->ip2) { hammer2_inode_drop(xop->ip2); xop->ip2 = NULL; }
+		if (xop->ip3) { hammer2_inode_drop(xop->ip3); xop->ip3 = NULL; }
+		if (xop->ip4) { hammer2_inode_drop(xop->ip4); xop->ip4 = NULL; }
+	}
 	if (xop->ip1) {
 		hammer2_xop_unset_ipdep(xop->ip1);
 		hammer2_inode_drop(xop->ip1);
@@ -602,6 +748,17 @@ hammer2_xop_feed(hammer2_xop_head_t *xop, hammer2_chain_t *chain, int clindex,
 	fifo = &xop->collect[clindex];
 	while (fifo->ri == fifo->wi - xop->fifo_size) {
 		if ((xop->run_mask & HAMMER2_XOPMASK_VOP) == 0) {
+			error = HAMMER2_ERROR_ABORTED;
+			goto done;
+		}
+		/*
+		 * Bounded callers stop here instead of growing.  DragonFly sleeps
+		 * for the frontend to drain, which this port cannot do (XOPs run
+		 * inline), so an unbounded grow buffers the entire remaining scan
+		 * on every call.  The caller resumes from its cursor.
+		 */
+		if ((xop->flags & HAMMER2_XOP_FIFO_BOUND) &&
+		    xop->fifo_size >= HAMMER2_XOPFIFO_BOUND) {
 			error = HAMMER2_ERROR_ABORTED;
 			goto done;
 		}

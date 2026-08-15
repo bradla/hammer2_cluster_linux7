@@ -73,16 +73,68 @@ hammer2_lk_t hammer2_mntlk;
 
 /* sysctl */
 static int hammer2_supported_version = HAMMER2_VOL_VERSION_DEFAULT;
+/*
+ * newfs_hammer2 asks the running VFS what volume version it supports via
+ * sysctlbyname("vfs.hammer2.supported_version").  SYSCTL_INT() below is a
+ * no-op stub in this port, so the lookup ALWAYS failed and every mkfs printed
+ *
+ *   newfs_hammer2: WARNING: HAMMER2 VFS not loaded, cannot get version info.
+ *
+ * which is both untrue (the module is loaded) and enough stray output to fail
+ * xfstests generic/740 and 741.  Export it as a read-only module parameter so
+ * userspace can read the real value from
+ * /sys/module/hammer2/parameters/hammer2_supported_version, and so the warning
+ * once again means what it says that the module is genuinely not loaded.
+ */
+module_param(hammer2_supported_version, int, 0444);
+MODULE_PARM_DESC(hammer2_supported_version,
+	"Highest HAMMER2 volume version supported by this module (read-only)");
 int hammer2_cluster_meta_read = 1; /* for physical read-ahead */
 int hammer2_cluster_data_read = 4; /* for physical read-ahead */
 int hammer2_cluster_write; /* for physical write clustering */
+int hammer2_fsync_durable = 1;
+/*
+ * fsync()/sync_fs() durability.  HAMMER2 has no journal, so making an fsync
+ * survive a power cut means flushing the whole PFS topology, rewriting the
+ * volume header, and pushing the block device's buffers out there is no
+ * cheap per-file commit point.  Measured on this port:
+ *
+ *   durable=1   15 fsync/s (median 787ms), metadata 69 ops/s
+ *   durable=0   113k fsync/s (median 0.1ms), metadata 31k ops/s
+ *
+ * With durable=0 the data reaches the block device's page cache only: fsync()
+ * returns success and a power failure loses it (xfstests generic/034, 056,
+ * 065, 073, 090, 101, 104, 106, 107, 321, 322, 325, 335, 336 all detect this).
+ * Correctness is the default; the knob exists because a 450x metadata
+ * slowdown is not acceptable for every workload, and because batching fsyncs
+ * (or a journal) is the real fix.
+ */
+module_param(hammer2_fsync_durable, int, 0644);
+MODULE_PARM_DESC(hammer2_fsync_durable,
+	"fsync() flushes topology+volume header+device (1=durable, 0=fast but loses data on power failure)");
+
 int hammer2_dedup_enable = 1;
+/*
+ * SYSCTL_INT() is a no-op stub in this port, so every BSD tunable below is
+ * unreachable at runtime.  Expose the ones worth bisecting with as real module
+ * parameters: /sys/module/hammer2/parameters/.  dedup_enable in particular lets
+ * a suspected dedup/bulkfree interaction be A/B tested without a rebuild.
+ */
+module_param(hammer2_dedup_enable, int, 0644);
+MODULE_PARM_DESC(hammer2_dedup_enable,
+	"Enable block deduplication on write (1=on, 0=off)");
 int hammer2_count_inode_allocated;
 int hammer2_count_chain_allocated;
 int hammer2_count_chain_modified;
 int hammer2_count_dio_allocated;
 long hammer2_limit_dirty_chains;	/* dirty-chain throttle limit */
+module_param(hammer2_limit_dirty_chains, long, 0644);
+MODULE_PARM_DESC(hammer2_limit_dirty_chains,
+	"Dirty chains allowed before a writer is throttled (0 = auto at mount)");
 int hammer2_dio_limit = 256;
+module_param(hammer2_dio_limit, int, 0644);
+MODULE_PARM_DESC(hammer2_dio_limit,
+	"Cached 64KiB device buffers to keep for reuse (memory ~= limit * 64KiB)");
 int hammer2_bulkfree_tps = 5000;
 int hammer2_limit_scan_depth;
 int hammer2_limit_saved_chains;
@@ -138,7 +190,7 @@ hammer2_assert_clean(void)
 	 * Port note: DragonFly BUG()s here (KKASSERT) under INVARIANTS if any
 	 * inode/chain/dio is still allocated at unmount/module-unload.  This
 	 * Linux port can leak a small, bounded number of in-memory metadata
-	 * chains on teardown (the on-disk state is already consistent -- the
+	 * chains on teardown (the on-disk state is already consistent 
 	 * volume root and freemap are flushed before this check).  Crashing
 	 * the kernel over an in-memory leak prevents a clean unmount, so we
 	 * downgrade these to warnings.  TODO: track down the residual chain
@@ -653,8 +705,8 @@ hammer2_mount(struct mount *mp)
 	 * Port note: DragonFly's hammer2_init_devvp() opened the device
 	 * vnodes; this Linux port split opening into hammer2_open_devvp().
 	 * The device-already-mounted scan below compares e->bdev, so the
-	 * devices must be opened *before* that scan -- not deferred to the
-	 * hmp==NULL branch as the original port did (which left e->bdev NULL
+	 * devices must be opened *before* that scan not deferred to the
+	 * hmp==NULL branch (which left e->bdev NULL
 	 * and tripped KKASSERT(e->bdev)).
 	 */
 	error = hammer2_open_devvp(mp, &devvpl);
@@ -1264,10 +1316,17 @@ again:
 
 	if ((hmp->vchain.flags | hmp->fchain.flags) &
 	    HAMMER2_CHAIN_FLUSH_MASK) {
+		/*
+		 * Degraded, but do NOT BUG().  This fires when the final flush could
+		 * not drain after ENOSPC in particular and panicking here is
+		 * strictly worse than continuing: the umount dies mid-teardown
+		 * holding the VFS mount lock, so every later mount/umount on the
+		 * machine hangs in D state.  That is what stalled xfstests around
+		 * generic/338-341.  Report it and finish tearing the mount down.
+		 */
 		hprintf("chains left over after final sync "
-		    "vchain %08x fchain %08x\n",
+		    "vchain %08x fchain %08x (unmounting anyway)\n",
 		    hmp->vchain.flags, hmp->fchain.flags);
-		KKASSERT(0);
 	}
 
 	hammer2_pfsfree_scan(hmp, 1);
@@ -1696,6 +1755,22 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
 		hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
 }
 
+/*
+ * Total failed device I/Os across every device backing this PFS.  Sampled
+ * across a sync pass by hammer2_vfs_sync_pmp() to detect a dead device.
+ */
+static int
+hammer2_pmp_iofail_count(hammer2_pfs_t *pmp)
+{
+	int i, sum = 0;
+
+	for (i = 0; i < HAMMER2_MAXCLUSTER; ++i) {
+		if (pmp->pfs_hmps[i])
+			sum += pmp->pfs_hmps[i]->iofail_count;
+	}
+	return (sum);
+}
+
 int
 hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor __unused)
 {
@@ -1704,6 +1779,7 @@ hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor __unused)
 	struct inode *vp;
 	uint32_t pass2;
 	int error, dorestart;
+	int iofail, iofail_passes = 0, syncfail = 0;
 
 	/*
 	 * Move all inodes on sideq to syncq.  This will clear sideq.
@@ -1733,6 +1809,7 @@ hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor __unused)
 	 */
 restart:
 	debug_hprintf("FILESYSTEM SYNC RESTART (%d)\n", dorestart);
+	iofail = hammer2_pmp_iofail_count(pmp);	/* device I/O failures so far */
 	hammer2_trans_setflags(pmp, 0);
 	hammer2_trans_clearflags(pmp, HAMMER2_TRANS_RESCAN);
 
@@ -1850,9 +1927,39 @@ restart:
 		/*
 		 * Relock the inode, and we inherit a ref from the above.
 		 * We will check for a race after we acquire the vnode.
+		 *
+		 * This must NOT block.  DragonFly's escape from the deadlock
+		 * described above is vget(vp, LK_EXCLUSIVE|LK_NOWAIT): an
+		 * exclusive vnode lock that FAILS when the frontend holds it,
+		 * sending the inode down the defer path.  igrab() only takes a
+		 * reference and succeeds for any live inode, so that escape does
+		 * not exist here and a blocking acquisition deadlocks outright:
+		 *
+		 *   frontend rename() holds ip_a and waits in hammer2_inode_lock()
+		 *   for ip_b to leave SYNCQ; only this loop clears SYNCQ, but it
+		 *   reaches ip_a first and blocks on ip_a->lock forever.
+		 *
+		 * Confirmed on 7.1.8 with four concurrent create/rename/unlink
+		 * workers: the syncer sat in __mutex_lock under this line while
+		 * the kernel reported the owner as a task parked in
+		 * hammer2_inode_lock() from hammer2_rename().
+		 *
+		 * Defer instead, exactly as the igrab() failure path above does.
+		 * Clearing SYNCQ (already done further up) lets the frontend
+		 * proceed, and dorestart brings this inode back around once it
+		 * has released its locks.
 		 */
-		/* XXX2 DragonFly takes inode lock before vget */
-		hammer2_mtx_ex(&ip->lock);
+		if (hammer2_mtx_ex_try(&ip->lock) != 0) {
+			hammer2_inode_delayed_sideq(ip);
+			dorestart |= 1;
+			if (pass2 & HAMMER2_INODE_SYNCQ_PASS2)
+				dorestart |= 2;
+			hammer2_inode_drop(ip);
+			if (vp)
+				iput(vp);
+			hammer2_spin_ex(&pmp->list_spin);
+			continue;
+		}
 
 		/*
 		 * If the inode wound up on a SIDEQ again it will already be
@@ -1954,7 +2061,43 @@ restart:
 	}
 	hammer2_spin_unex(&pmp->list_spin);
 
-	if (dorestart || (pmp->trans.flags & HAMMER2_TRANS_RESCAN)) {
+	/*
+	 * An inode that fails to write out keeps its dirty flags, so it is put
+	 * straight back on the SIDEQ and the restart below picks it up again.
+	 * When the failure is persistent the device is gone, every write
+	 * returns EIO that is an infinite loop, and it is not a quiet one:
+	 * xfstests generic/338 pulls the device out from under the mount and
+	 * umount(8) then span at 100% CPU indefinitely (sysrq-l put
+	 * hammer2_vfs_sync_pmp on the stack in every sample, with a different
+	 * inner frame each time).  The test never completed and the whole
+	 * xfstests run stalled behind it.
+	 *
+	 * Retrying is right for a transient failure and useless for a dead
+	 * device, and the two are told apart by whether the errors persist:
+	 * give up once HAMMER2_SYNC_IOFAIL_MAX consecutive passes have each
+	 * seen the device I/O failure count rise.  clean pass resets the
+	 * counter, so ordinary retrying under lock contention which is what
+	 * dorestart normally means is unaffected.  The inodes stay dirty on
+	 * the SIDEQ for whoever syncs next; nothing is dropped here, the sync
+	 * just stops spinning and reports EIO.
+	 *
+	 * obvious signal, write_inode_now() failing, does NOT work: it kept
+	 * returning success while the loop spun, because the pages were already
+	 * in the page cache and the writeback error is reported once and then
+	 * cleared. Count the failures where they actually happen, in the dio
+	 * layer (hammer2_io.c).
+	 */
+	if (hammer2_pmp_iofail_count(pmp) != iofail &&
+	    ++iofail_passes >= HAMMER2_SYNC_IOFAIL_MAX) {
+		hprintf("giving up sync after %d consecutive passes with I/O "
+		    "errors (device gone?)\n", iofail_passes);
+		syncfail = 1;
+	} else if (hammer2_pmp_iofail_count(pmp) == iofail) {
+		iofail_passes = 0;
+	}
+
+	if (!syncfail && (dorestart ||
+	    (pmp->trans.flags & HAMMER2_TRANS_RESCAN))) {
 		/*
 		 * bit 2 is set if something above thinks we might be
 		 * looping too hard, try to unclog the frontend
@@ -1994,7 +2137,7 @@ restart:
 
 	hammer2_bioq_sync(pmp);
 
-	error = 0; /* XXX */
+	error = syncfail ? EIO : 0;
 	hammer2_trans_done(pmp, HAMMER2_TRANS_ISFLUSH);
 
 	return (error);
