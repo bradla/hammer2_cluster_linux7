@@ -255,6 +255,14 @@ hammer2_chain_t *hammer2_chain_lookup(hammer2_chain_t **parentp,
 hammer2_chain_t *hammer2_chain_next(hammer2_chain_t **parentp,
 		hammer2_chain_t *chain, hammer2_key_t *key_nextp,
 		hammer2_key_t key_end, int *errorp, int flags);
+
+int  hammer2_chain_lookup_bref(hammer2_chain_t **parentp,
+		hammer2_key_t *key_nextp, hammer2_key_t key_beg,
+		hammer2_key_t key_end, hammer2_blockref_t *brefp,
+		int *errorp, int flags);
+int  hammer2_chain_next_bref(hammer2_chain_t **parentp,
+		hammer2_key_t *key_nextp, hammer2_key_t key_end,
+		hammer2_blockref_t *brefp, int *errorp, int flags);
 int  hammer2_chain_create(hammer2_chain_t **parentp, hammer2_chain_t **chainp,
 		hammer2_dev_t *hmp, hammer2_pfs_t *pmp, int methods,
 		hammer2_key_t key, int keybits, int type, size_t bytes,
@@ -733,6 +741,10 @@ struct hammer2_chain {
 #define HAMMER2_LOOKUP_MATCHIND     0x00000200
 #define HAMMER2_LOOKUP_ALWAYS       0x00000800
 
+#define HAMMER2_LOOKUP_ITERATE      0x00001000
+
+#define HAMMER2_LOOKUP_BREF         0x00002000
+
 /*
  * Flags passed to hammer2_chain_modify().
  */
@@ -766,14 +778,14 @@ struct hammer2_chain {
  * HAMMER2 cluster.
  */
 #define HAMMER2_XOPFIFO        16
-/*
- * Cap for HAMMER2_XOP_FIFO_BOUND XOPs: grow the collect FIFO up to this many
- * entries, then stop feeding and let the caller resume from its cursor.
- * Bounding at HAMMER2_XOPFIFO alone is correct but costs an XOP start (and a
- * btree seek) every 16 entries; 1024 keeps readdir near-linear without
- * buffering the whole directory.
- */
+
 #define HAMMER2_XOPFIFO_BOUND  1024
+
+#define HAMMER2_READDIR_BOUND_MIN  64
+#define HAMMER2_READDIR_BOUND_MAX  1024
+#define HAMMER2_READDIR_SLOP       1
+
+#define HAMMER2_READDIR_BOUND_LIMIT 65536
 
 #define HAMMER2_MAXCLUSTER     8
 #define HAMMER2_XOPMASK_VOP    ((uint32_t)0x80000000U)
@@ -912,6 +924,8 @@ typedef struct hammer2_xop_desc hammer2_xop_desc_t;
 
 struct hammer2_xop_fifo {
     hammer2_chain_t      **array;
+
+    hammer2_blockref_t   *brefs;
     int                  *errors;
     int                  ri;
     int                  wi;
@@ -935,6 +949,9 @@ struct hammer2_xop_head {
     uint32_t             chk_mask;
     int                  flags;
     int                  fifo_size;
+    int                  fifo_bound;   /* HAMMER2_XOP_FIFO_BOUND: stop after
+                                        * this many feeds (0 = use the
+                                        * HAMMER2_XOPFIFO_BOUND default) */
     int                  error;
     char                 *name1;
     size_t               name1_len;
@@ -1118,6 +1135,8 @@ union hammer2_xop {
  * getdents() buffer the whole remaining directory and readdir O(n^2).
  */
 #define HAMMER2_XOP_FIFO_BOUND    0x00000080
+
+#define HAMMER2_XOP_FIFO_BREF     0x00000100
 
 /*
  * Device vnode management structure (Linux uses block_device).
@@ -1338,6 +1357,10 @@ extern int hammer2_count_chain_allocated;
 extern int hammer2_count_chain_modified;
 extern int hammer2_count_dio_allocated;
 extern int hammer2_dio_limit;
+extern int hammer2_readdir_bound_min;
+extern int hammer2_readdir_bound_max;
+extern int hammer2_readdir_slop;
+extern int hammer2_readdir_bref;
 extern int hammer2_bulkfree_tps;
 extern int hammer2_limit_scan_depth;
 extern int hammer2_limit_saved_chains;
@@ -1366,6 +1389,7 @@ extern int hammer2_always_compress;
 void *hammer2_xop_alloc(hammer2_inode_t *, int);
 void hammer2_xop_setname(hammer2_xop_head_t *, const char *, size_t);
 void hammer2_xop_setname2(hammer2_xop_head_t *, const char *, size_t);
+void hammer2_xop_setbound(hammer2_xop_head_t *, int);
 size_t hammer2_xop_setname_inum(hammer2_xop_head_t *, u64);
 void hammer2_xop_setip2(hammer2_xop_head_t *, hammer2_inode_t *);
 void hammer2_xop_setip3(hammer2_xop_head_t *, hammer2_inode_t *);
@@ -1382,6 +1406,11 @@ void hammer2_volconf_update(hammer2_dev_t *hmp, int index);
 void hammer2_xop_retire(hammer2_xop_head_t *, uint32_t);
 int hammer2_xop_feed(hammer2_xop_head_t *, hammer2_chain_t *, int, int);
 int hammer2_xop_collect(hammer2_xop_head_t *, int);
+
+int hammer2_xop_feed_bref(hammer2_xop_head_t *, const hammer2_blockref_t *,
+		hammer2_chain_t *, int, int);
+int hammer2_xop_collect_bref(hammer2_xop_head_t *, hammer2_blockref_t *,
+		hammer2_chain_t **);
 
 /* Inline helper functions */
 static inline int
@@ -1440,9 +1469,8 @@ hammer2_errno_to_error(int error)
 }
 
 static inline const void *
-hammer2_xop_gdata(hammer2_xop_head_t *xop)
+hammer2_xop_gdata_chain(hammer2_xop_head_t *xop, hammer2_chain_t *focus)
 {
-    hammer2_chain_t *focus = xop->cluster.focus;
     const void *data = focus->data;
 
     if (focus->dio) {
@@ -1454,6 +1482,12 @@ hammer2_xop_gdata(hammer2_xop_head_t *xop)
     }
 
     return data;
+}
+
+static inline const void *
+hammer2_xop_gdata(hammer2_xop_head_t *xop)
+{
+    return hammer2_xop_gdata_chain(xop, xop->cluster.focus);
 }
 
 static inline void

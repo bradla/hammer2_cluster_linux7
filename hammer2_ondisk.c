@@ -50,6 +50,17 @@
  * hammer2_devvp_t.
  */
 
+/*
+ * Claim token passed as the bdev_file_open_by_path() holder.
+ *
+ * A non-NULL holder makes the open exclusive, which set_blocksize() requires
+ * (blkdev_bszset() reopens the device with BLK_OPEN_EXCL for exactly this
+ * reason).  Every HAMMER2 mount shares this one token on purpose: bd_may_claim()
+ * always lets the *same* holder re-claim, so a second PFS mount of a device we
+ * already have open still succeeds, while a different filesystem is kept out.
+ */
+static char hammer2_bdev_holder;
+
 int
 hammer2_open_devvp(void *mp, const hammer2_devvp_list_t *devvpl)
 {
@@ -61,10 +72,28 @@ hammer2_open_devvp(void *mp, const hammer2_devvp_list_t *devvpl)
 	(void)mp;
 
 	TAILQ_FOREACH(e, devvpl, entry) {
+		blk_mode_t mode;
+		int exclusive = 1;
+
 		KKASSERT(e->path);
-		bdev_file = bdev_file_open_by_path(e->path,
-		    rdonly ? BLK_OPEN_READ : (BLK_OPEN_READ | BLK_OPEN_WRITE),
-		    NULL, NULL);
+		mode = rdonly ? BLK_OPEN_READ : (BLK_OPEN_READ | BLK_OPEN_WRITE);
+
+		bdev_file = bdev_file_open_by_path(e->path, mode,
+		    &hammer2_bdev_holder, NULL);
+		if (IS_ERR(bdev_file)) {
+			/*
+			 * Someone else already claims the device.  Fall back to
+			 * the old unclaimed open rather than refusing to mount:
+			 * without a holder we cannot call set_blocksize(), but a
+			 * device that already has a PAGE_SIZE block size does not
+			 * need it, and that covers every configuration that
+			 * worked before this change.  The check below is what
+			 * actually guarantees safety, so it is fine to get here.
+			 */
+			exclusive = 0;
+			bdev_file = bdev_file_open_by_path(e->path, mode,
+			    NULL, NULL);
+		}
 		if (IS_ERR(bdev_file)) {
 			error = PTR_ERR(bdev_file);
 			hprintf("bdev_file_open_by_path(%s) failed: %d\n",
@@ -76,13 +105,64 @@ hammer2_open_devvp(void *mp, const hammer2_devvp_list_t *devvpl)
 		e->open = 1;
 
 		/*
-		 * No set_blocksize() needed: HAMMER2's 64K device I/O is done
-		 * as PAGE_SIZE chunks via hammer2_dev_bread()/bwrite(), and
-		 * __bread()/__getblk() with an explicit PAGE_SIZE return the
-		 * correct data regardless of the device's default block size.
-		 * (set_blocksize() to 64K -- or even 4K -- is rejected with
-		 * -EINVAL on some devices, so we don't rely on it.)
+		 * Force the device's soft block size to PAGE_SIZE.
+		 *
+		 * hammer2_dev_bread()/hammer2_dev_bwrite() do all device I/O as
+		 * PAGE_SIZE buffer_heads.  __bread()/__getblk() locate buffers in
+		 * the bdev page cache using the DEVICE's i_blkbits, not the size
+		 * passed in, so if the device block size is smaller than PAGE_SIZE
+		 * every lookup past block 0 finds a buffer whose b_blocknr does not
+		 * match and __getblk_slow() retries forever:
+		 *
+		 *   __getblk_slow -> find_get_block_common -> (mismatch, NULL)
+		 *                 -> grow_buffers -> loop, with no signal check
+		 *
+		 * That is an unkillable spin inside the kernel hammer2_dev_bread()
+		 * never regains control, so it cannot be defended against by checking
+		 * the return value.  It also runs under hammer2_mntlk (the caller
+		 * takes it before hammer2_init_volumes()), so a single bad device
+		 * wedges every later HAMMER2 mount on the machine.  The only fix is
+		 * to never issue the mismatched __bread() in the first place.
+		 *
+		 * A device gets a block size below PAGE_SIZE whenever its size is
+		 * not a multiple of PAGE_SIZE: set_init_blocksize() picks the
+		 * largest power of two <= PAGE_SIZE that divides the device, so a
+		 * partition with an odd sector count is pinned at 512.  That is a
+		 * perfectly legal partition, and it used to be unmountable.
+		 *
+		 * (The previous code skipped set_blocksize() because it returned
+		 * -EINVAL.  The cause was the NULL holder above, not the device.)
 		 */
+		if (exclusive) {
+			error = set_blocksize(bdev_file, PAGE_SIZE);
+			if (error)
+				debug_hprintf("%s: set_blocksize(%lu) failed: "
+				    "%d\n", e->path, PAGE_SIZE, error);
+		}
+
+		/*
+		 * Verify rather than trust.  This check not the call above 
+		 * is what makes the mount safe: however the block size got its
+		 * value, issuing PAGE_SIZE __bread()s against a device that
+		 * disagrees is the unkillable spin described above.A device
+		 * that is already at PAGE_SIZE passes here without needing the
+		 * exclusive claim at all, so every setup that mounted before
+		 * this change still mounts.
+		 */
+		if (block_size(e->bdev) != PAGE_SIZE) {
+			hprintf("%s: device block size is %u, need %lu -- "
+			    "refusing to mount (exclusive open %s, logical "
+			    "block size %u, device size %llu bytes).  A device "
+			    "whose size is not a multiple of %lu is pinned "
+			    "below PAGE_SIZE by set_init_blocksize(); "
+			    "repartition to a size divisible by %lu.\n",
+			    e->path, block_size(e->bdev), PAGE_SIZE,
+			    exclusive ? "held" : "refused",
+			    bdev_logical_block_size(e->bdev),
+			    (unsigned long long)bdev_nr_bytes(e->bdev),
+			    PAGE_SIZE, PAGE_SIZE);
+			return EINVAL;
+		}
 	}
 
 	return error;

@@ -519,9 +519,9 @@ struct vfsops {
  * hprintf() is rate limited, because almost every call site sits on a path that
  * runs once per block/chain/inode and so repeats without bound when the failure
  * is persistent rather than transient.  A single bad freemap leaf logged
- * which starved
+ * 6,862,961 messages ("Missed 6862961 kernel messages"), which starved
  * journald, killed sshd and ended in a watchdog reset; rate limiting just that
- * one site simply moved the storm to the next two messages
+ * one site simply moved the storm to the next two (124,038 and 34,087 messages
  * from hammer2_chain.c and hammer2_inode.c).  There are ~213 hprintf() call
  * sites and any of them can be the next one, so the limit belongs in the macro.
  *
@@ -534,6 +534,18 @@ struct vfsops {
 #define debug_hprintf(fmt, ...)		pr_debug("hammer2: " fmt, ##__VA_ARGS__)
 /* Retained as an explicit spelling for sites where the storm was observed. */
 #define hprintf_rl(fmt, ...)		pr_info_ratelimited("hammer2: " fmt, ##__VA_ARGS__)
+/*
+ * NOT rate-limited, for opt-in diagnostic dumps only.
+ *
+ * Rate-limiting hprintf() silently broke the CHECKFAIL/CKHIST dump: that
+ * diagnostic emits one burst of many related lines (the per-page sample plus
+ * every matching setcheck history entry) and is worthless partially printed,
+ * but pr_info_ratelimited() allows only ~10 per site per 5s and drops the rest.
+ * Every hprintf_diag() site must be gated behind a hammer2_debug bit that is off
+ * by default, so it can never reproduce the unbounded storm hprintf() was
+ * rate-limited for, and must bound its own output.
+ */
+#define hprintf_diag(fmt, ...)		pr_info("hammer2: " fmt, ##__VA_ARGS__)
 /*
  * Userspace printf doesn't exist in kernel code; redirect to pr_info() so
  * BSD debug call sites compile and produce dmesg output.

@@ -153,6 +153,86 @@ hammer2_xop_ipcluster(hammer2_xop_t *arg, void *scratch, int clindex)
 }
 
 /*
+ * Bref-only directory scan, used when the frontend allocated the XOP with
+ * HAMMER2_XOP_FIFO_BREF.  Feeds blockref COPIES instead of held chains, so no
+ * hammer2_chain_t is built for the common directory entry at all.
+ *
+ * A blockref is the entire directory entry when the name fits in
+ * bref.check.buf (64 bytes) -- hammer2_xop_dirent_create() stores it there and
+ * puts inum/type in bref.embed.dirent, allocating no child block at all.  For
+ * anything else (a longer name, or an entry that is an INODE rather than a
+ * DIRENT) the payload is in the child block, so a chain is fetched for that
+ * entry alone and fed alongside its bref.
+ *
+ * (*parentp) is locked on entry and stays locked; the caller unlocks it.
+ */
+static int
+hammer2_xop_readdir_bref(hammer2_xop_readdir_t *xop, hammer2_chain_t **parentp,
+    hammer2_key_t lkey, int clindex)
+{
+	hammer2_blockref_t bref;
+	hammer2_chain_t *chain;
+	hammer2_key_t key_next;
+	int lflags = HAMMER2_LOOKUP_ALWAYS | HAMMER2_LOOKUP_SHARED;
+	int error = 0, have;
+
+	/*
+	 * Exact-key probe then ranged scan, mirroring the chain path: ITERATE
+	 * is a no-op when key_beg == key_end, so it is only set on the range.
+	 */
+	have = hammer2_chain_lookup_bref(parentp, &key_next, lkey, lkey, &bref,
+	    &error, lflags);
+	if (!have && error == 0)
+		have = hammer2_chain_lookup_bref(parentp, &key_next, lkey,
+		    HAMMER2_KEY_MAX, &bref, &error,
+		    lflags | HAMMER2_LOOKUP_ITERATE);
+
+	while (have && error == 0) {
+		chain = NULL;
+		if (bref.type != HAMMER2_BREF_TYPE_DIRENT ||
+		    bref.embed.dirent.namlen > sizeof(bref.check.buf)) {
+			/*
+			 * Needs the child block.  The element is a direct child
+			 * of *parentp (that is where its blockref came from),
+			 * so this lookup neither ascends nor descends and the
+			 * scan cursor -- which is bref.key, not key_next -- is
+			 * unaffected.
+			 */
+			chain = hammer2_chain_lookup(parentp, &key_next,
+			    bref.key, bref.key, &error, lflags);
+			if (error)
+				break;
+			if (chain == NULL) {
+				/* Deleted under us; skip rather than report. */
+				have = hammer2_chain_next_bref(parentp,
+				    &key_next, HAMMER2_KEY_MAX, &bref, &error,
+				    lflags | HAMMER2_LOOKUP_ITERATE);
+				continue;
+			}
+		}
+
+		/*
+		 * feed_bref() takes its own hold on chain when non-NULL (the
+		 * frontend releases it with hammer2_xop_pdata()), so drop our
+		 * lock and reference either way.
+		 */
+		error = hammer2_xop_feed_bref(&xop->head, &bref, chain, clindex,
+		    0);
+		if (chain) {
+			hammer2_chain_unlock(chain);
+			hammer2_chain_drop(chain);
+		}
+		if (error)
+			break;
+
+		have = hammer2_chain_next_bref(parentp, &key_next,
+		    HAMMER2_KEY_MAX, &bref, &error,
+		    lflags | HAMMER2_LOOKUP_ITERATE);
+	}
+	return (error);
+}
+
+/*
  * Backend for hammer2_readdir().
  */
 void
@@ -176,23 +256,40 @@ hammer2_xop_readdir(hammer2_xop_t *arg, void *scratch, int clindex)
 		goto done;
 	}
 
+	/* Bref-only scan; see hammer2_xop_readdir_bref(). */
+	if (xop->head.flags & HAMMER2_XOP_FIFO_BREF) {
+		error = hammer2_xop_readdir_bref(xop, &parent, lkey, clindex);
+		hammer2_chain_unlock(parent);
+		hammer2_chain_drop(parent);
+		goto done;
+	}
+
 	/*
 	 * Directory scan [re]start and loop, the feed inherits the chain's
 	 * lock so do not unlock it on the iteration.
+	 *
+	 * LOOKUP_ITERATE on the ranged calls: this is a one-element-at-a-time
+	 * sweep to HAMMER2_KEY_MAX, so the parent only has to enclose the key
+	 * we are asking for.  Without it every entry ascends to the directory
+	 * inode and descends again (O(n * depth); see HAMMER2_LOOKUP_ITERATE).
+	 * The first call is an exact-key probe (key_beg == key_end) where the
+	 * flag is a no-op, so it is left off.
 	 */
 	chain = hammer2_chain_lookup(&parent, &key_next, lkey, lkey, &error,
 	    HAMMER2_LOOKUP_ALWAYS | HAMMER2_LOOKUP_SHARED);
 	if (chain == NULL)
 		chain = hammer2_chain_lookup(&parent, &key_next, lkey,
 		    HAMMER2_KEY_MAX, &error,
-		    HAMMER2_LOOKUP_ALWAYS | HAMMER2_LOOKUP_SHARED);
+		    HAMMER2_LOOKUP_ALWAYS | HAMMER2_LOOKUP_SHARED |
+		    HAMMER2_LOOKUP_ITERATE);
 	while (chain) {
 		error = hammer2_xop_feed(&xop->head, chain, clindex, 0);
 		if (error)
 			goto break2;
 		chain = hammer2_chain_next(&parent, chain, &key_next,
 		    HAMMER2_KEY_MAX, &error,
-		    HAMMER2_LOOKUP_ALWAYS | HAMMER2_LOOKUP_SHARED);
+		    HAMMER2_LOOKUP_ALWAYS | HAMMER2_LOOKUP_SHARED |
+		    HAMMER2_LOOKUP_ITERATE);
 	}
 break2:
 	if (chain) {

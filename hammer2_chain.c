@@ -388,11 +388,9 @@ hammer2_chain_rehold(hammer2_chain_t *chain)
  * convoluted but we can't just recurse without potentially blowing out
  * the kernel stack.
  *
- * The chain cannot be freed if:
- * it has any children.
- * flagged MODIFIED unless we can dispose of it.
- * flagged UPDATE unless we can dispose of it.
- * 
+ * The chain cannot be freed if it has any children.
+ * The chain cannot be freed if flagged MODIFIED unless we can dispose of it.
+ * The chain cannot be freed if flagged UPDATE unless we can dispose of it.
  * Any dedup registration can remain intact.
  *
  * The core spinlock is allowed to nest child-to-parent (not parent-to-child).
@@ -2057,7 +2055,7 @@ hammer2_chain_repchange(hammer2_chain_t *parent, hammer2_chain_t *chain)
  *
  * The new (*parentp) will be locked shared or exclusive (depending on flags),
  * and referenced, and the old will be unlocked and dereferenced (no change
- * if they are both the same).  Is particularly important if the caller
+ * if they are both the same). is particularly important if the caller
  * wishes to insert a new chain, (*parentp) will be set properly even if NULL
  * is returned, as long as no error occurred.
  *
@@ -2078,14 +2076,16 @@ hammer2_chain_repchange(hammer2_chain_t *parent, hammer2_chain_t *chain)
  *	  HAMMER2_LOOKUP_ALWAYS to force resolution (but be careful w/
  *	  BREF_TYPE_DATA as the device buffer can alias the logical file
  *	  buffer).
+ *
  */
-hammer2_chain_t *
-hammer2_chain_lookup(hammer2_chain_t **parentp, hammer2_key_t *key_nextp,
-    hammer2_key_t key_beg, hammer2_key_t key_end, int *errorp, int flags)
+static hammer2_chain_t *
+hammer2_chain_lookup_int(hammer2_chain_t **parentp, hammer2_key_t *key_nextp,
+    hammer2_key_t key_beg, hammer2_key_t key_end, hammer2_blockref_t *brefp,
+    int *errorp, int flags)
 {
 	hammer2_chain_t *chain, *parent;
 	hammer2_blockref_t bsave, *base, *bref;
-	hammer2_key_t scan_beg, scan_end;
+	hammer2_key_t scan_beg, scan_end, encl_end;
 	int how_always = HAMMER2_RESOLVE_ALWAYS;
 	int how_maybe = HAMMER2_RESOLVE_MAYBE;
 	int how, generation, count = 0, maxloops = 300000;
@@ -2115,13 +2115,15 @@ hammer2_chain_lookup(hammer2_chain_t **parentp, hammer2_key_t *key_nextp,
 	hammer2_mtx_assert_locked(&parent->lock);
 	*errorp = 0;
 
+	encl_end = (flags & HAMMER2_LOOKUP_ITERATE) ? key_beg : key_end;
+
 	while (parent->bref.type == HAMMER2_BREF_TYPE_INDIRECT ||
 	    parent->bref.type == HAMMER2_BREF_TYPE_FREEMAP_NODE) {
 		scan_beg = parent->bref.key;
 		scan_end = scan_beg +
 		    ((hammer2_key_t)1 << parent->bref.keybits) - 1;
 		if ((parent->flags & HAMMER2_CHAIN_DELETED) == 0)
-			if (key_beg >= scan_beg && key_end <= scan_end)
+			if (key_beg >= scan_beg && encl_end <= scan_end)
 				break;
 		parent = hammer2_chain_repparent(parentp, how_maybe);
 	}
@@ -2270,6 +2272,15 @@ again:
 
 	/* Selected from blockref or in-memory chain. */
 	bsave = *bref;
+
+	if (chain == NULL && brefp &&
+	    bsave.type != HAMMER2_BREF_TYPE_INDIRECT &&
+	    bsave.type != HAMMER2_BREF_TYPE_FREEMAP_NODE) {
+		hammer2_spin_unex(&parent->core.spin);
+		*brefp = bsave;
+		return (NULL);
+	}
+
 	if (chain == NULL) {
 		hammer2_spin_unex(&parent->core.spin);
 		if (bsave.type == HAMMER2_BREF_TYPE_INDIRECT ||
@@ -2359,6 +2370,51 @@ done:
 	 *	 trying to reach the chain.
 	 */
 	return (chain);
+}
+
+hammer2_chain_t *
+hammer2_chain_lookup(hammer2_chain_t **parentp, hammer2_key_t *key_nextp,
+    hammer2_key_t key_beg, hammer2_key_t key_end, int *errorp, int flags)
+{
+	return (hammer2_chain_lookup_int(parentp, key_nextp, key_beg, key_end,
+	    NULL, errorp, flags));
+}
+
+int
+hammer2_chain_lookup_bref(hammer2_chain_t **parentp, hammer2_key_t *key_nextp,
+    hammer2_key_t key_beg, hammer2_key_t key_end, hammer2_blockref_t *brefp,
+    int *errorp, int flags)
+{
+	hammer2_chain_t *chain;
+
+	brefp->type = HAMMER2_BREF_TYPE_EMPTY;
+	chain = hammer2_chain_lookup_int(parentp, key_nextp, key_beg, key_end,
+	    brefp, errorp, flags | HAMMER2_LOOKUP_BREF);
+	if (chain) {
+		*brefp = chain->bref;
+		hammer2_chain_unlock(chain);
+		hammer2_chain_drop(chain);
+	}
+	return (brefp->type != HAMMER2_BREF_TYPE_EMPTY);
+}
+
+int
+hammer2_chain_next_bref(hammer2_chain_t **parentp, hammer2_key_t *key_nextp,
+    hammer2_key_t key_end, hammer2_blockref_t *brefp, int *errorp, int flags)
+{
+	hammer2_key_t key_beg;
+
+	KKASSERT(brefp->type != HAMMER2_BREF_TYPE_EMPTY);
+
+	/* Step past the element just consumed; watch for wrap. */
+	key_beg = brefp->key + ((hammer2_key_t)1 << brefp->keybits);
+	if (key_beg == 0 || key_beg > key_end) {
+		*errorp = 0;
+		brefp->type = HAMMER2_BREF_TYPE_EMPTY;
+		return (0);
+	}
+	return (hammer2_chain_lookup_bref(parentp, key_nextp, key_beg, key_end,
+	    brefp, errorp, flags));
 }
 
 /*
@@ -4682,7 +4738,7 @@ hammer2_chain_check_debug(hammer2_chain_t *chain, void *bdata)
 		computed = XXH64(bdata, chain->bytes, XXH_HAMMER2_SEED);
 		stored = chain->bref.check.xxhash64.value;
 	}
-	hprintf("CHECKFAIL %s off %016llx bytes %u meth %02x flags %08x "
+	hprintf_diag("CHECKFAIL %s off %016llx bytes %u meth %02x flags %08x "
 	    "stored %016llx computed %016llx media %s "
 	    "first16 %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
 	    hammer2_breftype_to_str(chain->bref.type),
@@ -4699,24 +4755,53 @@ hammer2_chain_check_debug(hammer2_chain_t *chain, void *bdata)
 	 * located offline: which pages made it and which did not.
 	 */
 	for (i = 0; i + 8 <= chain->bytes; i += 4096) {
-		hprintf("  PAGE %2u off %5u %02x%02x%02x%02x%02x%02x%02x%02x\n",
+		hprintf_diag("  PAGE %2u off %5u %02x%02x%02x%02x%02x%02x%02x%02x\n",
 		    i / 4096, i, p[i], p[i+1], p[i+2], p[i+3],
 		    p[i+4], p[i+5], p[i+6], p[i+7]);
 	}
 
-	for (i = 0; i < HAMMER2_CKHIST; ++i) {
-		if (hammer2_ckhist[i].data_off != chain->bref.data_off &&
-		    hammer2_ckhist[i].key != chain->bref.key)
-			continue;
-		hprintf("  CKHIST off %016llx key %016llx check %016llx bytes %u meth %02x "
-		    "age %lu ticks%s%s\n",
-		    (long long)hammer2_ckhist[i].data_off,
-		    (long long)hammer2_ckhist[i].key,
-		    (long long)hammer2_ckhist[i].check,
-		    hammer2_ckhist[i].bytes, hammer2_ckhist[i].methods,
-		    getticks() - hammer2_ckhist[i].ticks,
-		    hammer2_ckhist[i].check == stored ? " ==STORED" : "",
-		    hammer2_ckhist[i].check == computed ? " ==MEDIA" : "");
+#define HAMMER2_CKHIST_DUMP	128
+	{
+		unsigned int shown = 0, matched = 0, hit_stored = 0, hit_media = 0;
+
+		for (i = 0; i < HAMMER2_CKHIST; ++i) {
+			if (hammer2_ckhist[i].data_off != chain->bref.data_off &&
+			    hammer2_ckhist[i].key != chain->bref.key)
+				continue;
+			++matched;
+			if (hammer2_ckhist[i].check == stored)
+				++hit_stored;
+			if (hammer2_ckhist[i].check == computed)
+				++hit_media;
+			if (shown >= HAMMER2_CKHIST_DUMP)
+				continue;
+			++shown;
+			hprintf_diag("  CKHIST off %016llx key %016llx check %016llx bytes %u meth %02x "
+			    "age %lu ticks%s%s\n",
+			    (long long)hammer2_ckhist[i].data_off,
+			    (long long)hammer2_ckhist[i].key,
+			    (long long)hammer2_ckhist[i].check,
+			    hammer2_ckhist[i].bytes, hammer2_ckhist[i].methods,
+			    getticks() - hammer2_ckhist[i].ticks,
+			    hammer2_ckhist[i].check == stored ? " ==STORED" : "",
+			    hammer2_ckhist[i].check == computed ? " ==MEDIA" : "");
+		}
+		/*
+		 * The verdict line.  This is the whole point of the ring:
+		 *
+		 *   ==STORED present  -> the stored check is a REAL earlier setcheck
+		 *                        for this block, i.e. a stale blockref: the
+		 *                        data path and the check path raced and the
+		 *                        parent kept an older check.
+		 *   ==STORED absent   -> the stored check was never computed for this
+		 *                        block at all wrong bytes, wrong length, or
+		 *                        a block reused under this chain.
+		 */
+		hprintf_diag("  CKHIST summary: %u matched, %u shown, %u match STORED, "
+		    "%u match MEDIA -> stored check %s\n",
+		    matched, shown, hit_stored, hit_media,
+		    hit_stored ? "IS a stale earlier setcheck (data/check path race)"
+			       : "was NEVER computed for this block (size or aliasing)");
 	}
 }
 

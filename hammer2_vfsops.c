@@ -42,6 +42,8 @@
 #include <linux/seq_file.h>
 #include <linux/parser.h>
 #include <linux/blkdev.h>
+#include <linux/sched.h>
+#include <linux/sched/debug.h>	/* sched_show_task() for mntlk owner dumps */
 
 int hammer2_unmount(struct mount *, int);
 static int hammer2_recovery(hammer2_dev_t *);
@@ -70,6 +72,72 @@ hammer2_pfslist_t hammer2_pfslist;
 static hammer2_pfslist_t hammer2_spmplist;
 
 hammer2_lk_t hammer2_mntlk;
+
+/*
+ * hammer2_mntlk owner tracking.
+ *
+ * hammer2_lk_t is an rw_semaphore, so hammer2_lk_ex() is down_write(): the
+ * waiter parks in TASK_UNINTERRUPTIBLE and the rwsem records nothing a dump can
+ * read back.  When umount wedged on this lock the holder was invisible and
+ * "no task has hammer2 in its stack" is NOT evidence that nobody holds it:
+ *
+ *   - a holder spinning in R state has an EMPTY /proc/PID/stack, so a sweep
+ *     that greps stacks for "hammer2" skips it entirely (this is exactly how
+ *     the __getblk_slow() spin in bug 21 presented), and
+ *   - down_write() is not recursive, so a path that re-enters while already
+ *     holding it self-deadlocks with genuinely no other holder to find.
+ *
+ * Record the owner and the acquisition site, and wait with a trylock loop so a
+ * stuck acquirer names the holder (and dumps its stack) instead of vanishing
+ * into D state.  Acquire/release rate on this lock is per-mount, so the loop
+ * costs nothing.
+ */
+static struct task_struct *hammer2_mntlk_owner;
+static const char *hammer2_mntlk_site = "none";
+
+#define hammer2_mntlk_ex()	hammer2_mntlk_ex_at(__func__)
+#define hammer2_mntlk_unlock()	hammer2_mntlk_unlock_at()
+
+static void
+hammer2_mntlk_ex_at(const char *site)
+{
+	unsigned long t0 = getticks();
+	struct task_struct *owner;
+	int reported = 0;
+
+	while (!down_write_trylock(&hammer2_mntlk)) {
+		schedule_timeout_uninterruptible(HZ / 10);
+		if (reported || time_before(getticks(), t0 + 30 * HZ))
+			continue;
+		reported = 1;
+		owner = READ_ONCE(hammer2_mntlk_owner);
+		if (owner == current) {
+			hprintf("mntlk: SELF-DEADLOCK in %s -- this task already "
+			    "holds the lock, taken in %s\n", site,
+			    READ_ONCE(hammer2_mntlk_site));
+		} else if (owner) {
+			hprintf("mntlk: %s blocked >30s; holder pid %d (%s) "
+			    "took it in %s, state 0x%x\n", site,
+			    owner->pid, owner->comm,
+			    READ_ONCE(hammer2_mntlk_site),
+			    (unsigned int)READ_ONCE(owner->__state));
+			sched_show_task(owner);
+		} else {
+			hprintf("mntlk: %s blocked >30s with NO recorded holder "
+			    "(lock leaked by an unbalanced release?)\n", site);
+		}
+	}
+	WRITE_ONCE(hammer2_mntlk_owner, current);
+	WRITE_ONCE(hammer2_mntlk_site, site);
+}
+
+static void
+hammer2_mntlk_unlock_at(void)
+{
+	WRITE_ONCE(hammer2_mntlk_owner, NULL);
+	WRITE_ONCE(hammer2_mntlk_site, "none");
+	hammer2_lk_unlock(&hammer2_mntlk);
+}
 
 /* sysctl */
 static int hammer2_supported_version = HAMMER2_VOL_VERSION_DEFAULT;
@@ -135,6 +203,42 @@ int hammer2_dio_limit = 256;
 module_param(hammer2_dio_limit, int, 0644);
 MODULE_PARM_DESC(hammer2_dio_limit,
 	"Cached 64KiB device buffers to keep for reuse (memory ~= limit * 64KiB)");
+
+/*
+ * readdir scan sizing.  Exposed as parameters because the right values depend
+ * on the getdents(2) buffer sizes a workload actually uses, and because they
+ * were otherwise unjustifiable constants being able to A/B them on a live
+ * box is what turned them from guesses into measured defaults.  See the
+ * derivation of HAMMER2_READDIR_BOUND_MAX in hammer2.h.
+ */
+int hammer2_readdir_bound_min = HAMMER2_READDIR_BOUND_MIN;
+module_param(hammer2_readdir_bound_min, int, 0644);
+MODULE_PARM_DESC(hammer2_readdir_bound_min,
+	"readdir: smallest directory scan, in entries (first call on an open)");
+
+int hammer2_readdir_bound_max = HAMMER2_READDIR_BOUND_MAX;
+module_param(hammer2_readdir_bound_max, int, 0644);
+MODULE_PARM_DESC(hammer2_readdir_bound_max,
+	"readdir: largest single scan round, in entries (peak pinned memory ~= value * 404 bytes)");
+
+int hammer2_readdir_slop = HAMMER2_READDIR_SLOP;
+module_param(hammer2_readdir_slop, int, 0644);
+MODULE_PARM_DESC(hammer2_readdir_slop,
+	"readdir: entries to over-scan past the previous call, so one round both fills the buffer and detects it is full");
+
+/*
+ * Bref-only readdir (see HAMMER2_LOOKUP_BREF).
+ *
+ * DEFAULTS OFF on purpose.  The root filesystem here is HAMMER2 and sudo(8)
+ * scans /etc/sudoers.d, so a readdir that returns wrong or missing entries
+ * costs the box its root access and with it any chance of writing this
+ * parameter back.  Booting on the old path and opting in at runtime means an
+ * A/B needs no reboot, and a scratch mount can be tested before / is.
+ */
+int hammer2_readdir_bref;
+module_param(hammer2_readdir_bref, int, 0644);
+MODULE_PARM_DESC(hammer2_readdir_bref,
+	"readdir: 1 = scan blockrefs without instantiating a chain per entry (default 0)");
 int hammer2_bulkfree_tps = 5000;
 int hammer2_limit_scan_depth;
 int hammer2_limit_saved_chains;
@@ -190,7 +294,7 @@ hammer2_assert_clean(void)
 	 * Port note: DragonFly BUG()s here (KKASSERT) under INVARIANTS if any
 	 * inode/chain/dio is still allocated at unmount/module-unload.  This
 	 * Linux port can leak a small, bounded number of in-memory metadata
-	 * chains on teardown (the on-disk state is already consistent 
+	 * chains on teardown (the on-disk state is already consistent the
 	 * volume root and freemap are flushed before this check).  Crashing
 	 * the kernel over an in-memory leak prevents a clean unmount, so we
 	 * downgrade these to warnings.  TODO: track down the residual chain
@@ -706,7 +810,7 @@ hammer2_mount(struct mount *mp)
 	 * vnodes; this Linux port split opening into hammer2_open_devvp().
 	 * The device-already-mounted scan below compares e->bdev, so the
 	 * devices must be opened *before* that scan not deferred to the
-	 * hmp==NULL branch (which left e->bdev NULL
+	 * hmp==NULL branch as the original port did (which left e->bdev NULL
 	 * and tripped KKASSERT(e->bdev)).
 	 */
 	error = hammer2_open_devvp(mp, &devvpl);
@@ -721,7 +825,7 @@ hammer2_mount(struct mount *mp)
 	 * check hmp will be non-NULL if we are doing the second or more
 	 * HAMMER2 mounts from the same device.
 	 */
-	hammer2_lk_ex(&hammer2_mntlk);
+	hammer2_mntlk_ex();
 	if (!TAILQ_EMPTY(&devvpl)) {
 		/*
 		 * Match the device.  Due to the way devfs works,
@@ -757,7 +861,7 @@ next_hmp:
 					hprintf("%s mounted %d\n", e->path,
 					    error);
 					hammer2_cleanup_devvp(&devvpl);
-					hammer2_lk_unlock(&hammer2_mntlk);
+					hammer2_mntlk_unlock();
 					return (error);
 				}
 			}
@@ -778,7 +882,7 @@ next_hmp:
 		if (hmp == NULL) {
 			hprintf("PFS label \"%s\" not found\n", label);
 			hammer2_cleanup_devvp(&devvpl);
-			hammer2_lk_unlock(&hammer2_mntlk);
+			hammer2_mntlk_unlock();
 			return (ENOENT);
 		}
 	}
@@ -799,14 +903,14 @@ next_hmp:
 		if (error) {
 			hammer2_close_devvp(&devvpl);
 			hammer2_cleanup_devvp(&devvpl);
-			hammer2_lk_unlock(&hammer2_mntlk);
+			hammer2_mntlk_unlock();
 			hfree(hmp, M_HAMMER2, sizeof(*hmp));
 			return (error);
 		}
 		if (!hmp->devvp) {
 			hprintf("failed to initialize root volume\n");
 			hammer2_unmount_helper(mp, NULL, hmp);
-			hammer2_lk_unlock(&hammer2_mntlk);
+			hammer2_mntlk_unlock();
 			hammer2_unmount(mp, MNT_FORCE);
 			return (EINVAL);
 		}
@@ -915,7 +1019,7 @@ next_hmp:
 		if (schain == NULL) {
 			hprintf("invalid super-root\n");
 			hammer2_unmount_helper(mp, NULL, hmp);
-			hammer2_lk_unlock(&hammer2_mntlk);
+			hammer2_mntlk_unlock();
 			hammer2_unmount(mp, MNT_FORCE);
 			return (EINVAL);
 		}
@@ -926,7 +1030,7 @@ next_hmp:
 			hammer2_chain_drop(schain);
 			schain = NULL;
 			hammer2_unmount_helper(mp, NULL, hmp);
-			hammer2_lk_unlock(&hammer2_mntlk);
+			hammer2_mntlk_unlock();
 			hammer2_unmount(mp, MNT_FORCE);
 			return (EINVAL);
 		}
@@ -1028,7 +1132,7 @@ next_hmp:
 	/* PFS could not be found? */
 	if (chain == NULL) {
 		hammer2_unmount_helper(mp, NULL, hmp);
-		hammer2_lk_unlock(&hammer2_mntlk);
+		hammer2_mntlk_unlock();
 		hammer2_unmount(mp, MNT_FORCE);
 
 		if (error) {
@@ -1055,7 +1159,7 @@ next_hmp:
 	if (pmp == NULL) {
 		hprintf("failed to acquire PFS structure\n");
 		hammer2_unmount_helper(mp, NULL, hmp);
-		hammer2_lk_unlock(&hammer2_mntlk);
+		hammer2_mntlk_unlock();
 		hammer2_unmount(mp, MNT_FORCE);
 		return (EINVAL);
 	}
@@ -1063,7 +1167,7 @@ next_hmp:
 	if (pmp->mp) {
 		hprintf("PFS already mounted!\n");
 		hammer2_unmount_helper(mp, NULL, hmp);
-		hammer2_lk_unlock(&hammer2_mntlk);
+		hammer2_mntlk_unlock();
 		hammer2_unmount(mp, MNT_FORCE);
 		return (EBUSY);
 	}
@@ -1071,7 +1175,7 @@ next_hmp:
 	if (hammer2_getnewfsid(mp)) {
 		hprintf("failed to get new fsid\n");
 		hammer2_unmount_helper(mp, NULL, hmp);
-		hammer2_lk_unlock(&hammer2_mntlk);
+		hammer2_mntlk_unlock();
 		hammer2_unmount(mp, MNT_FORCE);
 		return (EINVAL);
 	}
@@ -1096,12 +1200,12 @@ next_hmp:
 		if (error) {
 			hprintf("failed to update to rw\n");
 			hammer2_unmount_helper(mp, pmp, NULL);
-			hammer2_lk_unlock(&hammer2_mntlk);
+			hammer2_mntlk_unlock();
 			hammer2_unmount(mp, MNT_FORCE);
 			return (error);
 		}
 	}
-	hammer2_lk_unlock(&hammer2_mntlk);
+	hammer2_mntlk_unlock();
 
 	/* Initial statfs to prime mnt_stat. */
 	hammer2_statfs(mp, &mp->mnt_stat);
@@ -1168,7 +1272,7 @@ hammer2_unmount(struct mount *mp, int mntflags)
 	if (pmp == NULL)
 		return (0);
 
-	hammer2_lk_ex(&hammer2_mntlk);
+	hammer2_mntlk_ex();
 
 	/*
 	 * If mount initialization proceeded far enough we must flush
@@ -1193,7 +1297,7 @@ hammer2_unmount(struct mount *mp, int mntflags)
 
 	hammer2_unmount_helper(mp, pmp, NULL);
 failed:
-	hammer2_lk_unlock(&hammer2_mntlk);
+	hammer2_mntlk_unlock();
 
 	if (TAILQ_EMPTY(&hammer2_mntlist))
 		hammer2_assert_clean();
@@ -1745,12 +1849,56 @@ hammer2_sync(struct mount *mp, int waitfor)
  * the same: a heavy writer is throttled (it pays the flush cost) and dirty
  * chains cannot accumulate without bound.  Must be called BEFORE the caller
  * takes any HAMMER2 inode lock (i.e. at the top of the modifying VFS op).
+ *
+ * EXCEPT for PF_LOCAL_THROTTLE tasks see below.  Making the wrong task pay
+ * the flush cost deadlocks the machine.
  */
 void
 hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
 {
 	if (pmp == NULL || pmp->mp == NULL)
 		return;
+
+	/*
+	 * Never throttle a stacked block-device writer.
+	 *
+	 * PF_LOCAL_THROTTLE means "throttle writes only against the bdi I write
+	 * to, I am cleaning dirty pages from some other bdi" the loop driver
+	 * sets it on its worker, and dm-crypt-style targets do the same.  Linux
+	 * defines the flag precisely so balance_dirty_pages() will NOT stall
+	 * these tasks against the backing filesystem, because they are the only
+	 * thing that can drain the upper device: stall them and the dirty state
+	 * they are supposed to be clearing can never be cleared.
+	 *
+	 * This throttle re-introduced exactly that deadlock, because it is
+	 * strictly worse than a stall it makes the crossing writer run a full
+	 * synchronous hammer2_vfs_sync_pmp(MNT_WAIT) on the BACKING filesystem,
+	 * taking that pmp's ISFLUSH transaction (the one transaction type that
+	 * blocks) while an upper-device request is in flight.  Observed with a
+	 * HAMMER2 filesystem on a loop device backed by a file on a HAMMER2 root:
+	 *
+	 *   flush-hammer2-N (upper fs) -> hammer2_dev_bwrite(loop0, sync)
+	 *       -> sync_dirty_buffer, waiting for the loop request to complete
+	 *   kworker/uN+loop0           -> lo_rw_aio -> hammer2_write_iter
+	 *       -> hammer2_pfs_memory_wait -> hammer2_vfs_sync_pmp(root, MNT_WAIT)
+	 *   sshd fdatasync(root)       -> hammer2_trans_init, blocked on root ISFLUSH
+	 *
+	 * The loop worker cannot finish the request until the root flush it was
+	 * conscripted into completes, and that flush cannot complete without I/O
+	 * that is queued behind the very request the worker is holding.  Result:
+	 * a hard wedge with ZERO I/O on both devices, unkillable, sysrq to clear.
+	 *
+	 * This is not only a test-rig concern: any disk/VM/container image hosted
+	 * on HAMMER2 and attached via loop hits the same path.
+	 *
+	 * Such a task is exempt.  It is not the writer that is generating the
+	 * backlog it is draining someone else's so exempting it does not
+	 * weaken the throttle for the writer that actually caused the dirt, which
+	 * is still stalled on its own next write.
+	 */
+	if (current->flags & PF_LOCAL_THROTTLE)
+		return;
+
 	if (hammer2_count_chain_modified >= hammer2_limit_dirty_chains)
 		hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
 }
@@ -2075,16 +2223,16 @@ restart:
 	 * Retrying is right for a transient failure and useless for a dead
 	 * device, and the two are told apart by whether the errors persist:
 	 * give up once HAMMER2_SYNC_IOFAIL_MAX consecutive passes have each
-	 * seen the device I/O failure count rise.  clean pass resets the
+	 * seen the device I/O failure count rise.  A clean pass resets the
 	 * counter, so ordinary retrying under lock contention which is what
 	 * dorestart normally means is unaffected.  The inodes stay dirty on
 	 * the SIDEQ for whoever syncs next; nothing is dropped here, the sync
 	 * just stops spinning and reports EIO.
 	 *
-	 * obvious signal, write_inode_now() failing, does NOT work: it kept
+	 * The obvious signal, write_inode_now() failing, does NOT work: it kept
 	 * returning success while the loop spun, because the pages were already
 	 * in the page cache and the writeback error is reported once and then
-	 * cleared. Count the failures where they actually happen, in the dio
+	 * cleared.  Count the failures where they actually happen, in the dio
 	 * layer (hammer2_io.c).
 	 */
 	if (hammer2_pmp_iofail_count(pmp) != iofail &&

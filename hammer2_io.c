@@ -391,7 +391,7 @@ hammer2_io_putblk(hammer2_io_t **diop)
 	 * atomic or those callers hold a dio REF but not dio->lock, because
 	 * hammer2_io_getblk() drops the lock before returning.
 	 *
-	 * So holding dio->lock here does not make a read-modify-write on
+	 * holding dio->lock here does not make a read-modify-write on
 	 * dio->refs safe.  A plain `dio->refs--` reads the word, decrements,
 	 * and writes it back; an atomic OR landing on another CPU inside that
 	 * window is erased:
@@ -403,7 +403,7 @@ hammer2_io_putblk(hammer2_io_t **diop)
 	 * A lost DIRTY bit means the last drop below skips the writeback and
 	 * kvfree()s the buffer, so the modification never reaches media
 	 * while hammer2_chain_setcheck() has already hashed the in-memory
-	 * version into the parent blockref.  Next read of that block then
+	 * version into the parent blockref. The next read of that block then
 	 * fails its check code (HAMMER2_ERROR_CHECK -> EDOM), which is
 	 * indistinguishable from media corruption but is purely a lost update.
 	 *

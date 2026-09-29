@@ -72,7 +72,7 @@ H2XOPDESCRIPTOR(bmap);
  */
 static void
 hammer2_xop_fifo_alloc(hammer2_xop_fifo_t *fifo, size_t new_nmemb,
-    size_t old_nmemb)
+    size_t old_nmemb, int want_brefs)
 {
 	int flags = M_WAITOK | M_ZERO;
 	size_t new_size, old_size;
@@ -108,6 +108,18 @@ hammer2_xop_fifo_alloc(hammer2_xop_fifo_t *fifo, size_t new_nmemb,
 		    flags);
 	KKASSERT(fifo->errors);
 	adjust_malloc_leak(-old_size, M_HAMMER2);
+
+	if (want_brefs) {
+		new_size = new_nmemb * sizeof(hammer2_blockref_t);
+		old_size = old_nmemb * sizeof(hammer2_blockref_t);
+		if (!fifo->brefs)
+			fifo->brefs = hmalloc(new_size, M_HAMMER2, flags);
+		else
+			fifo->brefs = hrealloc(fifo->brefs, new_size, M_HAMMER2,
+			    flags);
+		KKASSERT(fifo->brefs);
+		adjust_malloc_leak(-old_size, M_HAMMER2);
+	}
 }
 
 /*
@@ -140,11 +152,60 @@ hammer2_xop_alloc(hammer2_inode_t *ip, int flags)
 
 	hammer2_xop_fifo_t *fifo = &xop->head.collect[0];
 	xop->head.fifo_size = HAMMER2_XOPFIFO;
-	hammer2_xop_fifo_alloc(fifo, xop->head.fifo_size, 0);
+	hammer2_xop_fifo_alloc(fifo, xop->head.fifo_size, 0,
+	    flags & HAMMER2_XOP_FIFO_BREF);
 
 	hammer2_inode_ref(ip);
 
 	return (xop);
+}
+
+void
+hammer2_xop_setbound(hammer2_xop_head_t *xop, int bound)
+{
+	hammer2_xop_fifo_t *fifo = &xop->collect[0];
+	hammer2_chain_t **narray;
+	hammer2_blockref_t *nbrefs;
+	int *nerrors;
+	int want;
+
+	KKASSERT(xop->flags & HAMMER2_XOP_FIFO_BOUND);
+	KKASSERT(bound > 0);
+
+	/* Round the ARRAY (not the bound) up to a power of two. */
+	want = HAMMER2_XOPFIFO;
+	while (want < bound)
+		want <<= 1;
+
+
+	if (want > xop->fifo_size) {
+		narray = hrealloc(fifo->array,
+		    want * sizeof(hammer2_chain_t *), M_HAMMER2, M_WAITOK);
+		if (narray) {
+			fifo->array = narray;
+			nerrors = hrealloc(fifo->errors, want * sizeof(int),
+			    M_HAMMER2, M_WAITOK);
+			if (nerrors) {
+				fifo->errors = nerrors;
+
+				if (xop->flags & HAMMER2_XOP_FIFO_BREF) {
+					nbrefs = hrealloc(fifo->brefs,
+					    want * sizeof(hammer2_blockref_t),
+					    M_HAMMER2, M_WAITOK);
+					if (nbrefs) {
+						fifo->brefs = nbrefs;
+						xop->fifo_size = want;
+					}
+				} else {
+					xop->fifo_size = want;
+				}
+			}
+		}
+	}
+
+	if (bound > xop->fifo_size)
+		bound = xop->fifo_size;
+	xop->fifo_bound = bound;
 }
 
 void
@@ -704,6 +765,11 @@ hammer2_xop_retire(hammer2_xop_head_t *xop, uint32_t mask)
 		hfree(fifo->array, M_HAMMER2,
 		    xop->fifo_size * sizeof(hammer2_chain_t *));
 		hfree(fifo->errors, M_HAMMER2, xop->fifo_size * sizeof(int));
+		if (fifo->brefs) {
+			hfree(fifo->brefs, M_HAMMER2,
+			    xop->fifo_size * sizeof(hammer2_blockref_t));
+			fifo->brefs = NULL;
+		}
 	}
 
 	if (xop->scratch)
@@ -728,9 +794,9 @@ hammer2_xop_retire(hammer2_xop_head_t *xop, uint32_t mask)
  * Returns non-zero on error.  In this situation the caller retains a
  * ref on the chain but loses the lock (we unlock here).
  */
-int
-hammer2_xop_feed(hammer2_xop_head_t *xop, hammer2_chain_t *chain, int clindex,
-    int error)
+static int
+hammer2_xop_feed_slot(hammer2_xop_head_t *xop, hammer2_chain_t *chain,
+    const hammer2_blockref_t *bref, int clindex, int error)
 {
 	hammer2_xop_fifo_t *fifo;
 	size_t old_fifo_size;
@@ -746,6 +812,16 @@ hammer2_xop_feed(hammer2_xop_head_t *xop, hammer2_chain_t *chain, int clindex,
 	 * We own the fifo->wi for our clindex.
 	 */
 	fifo = &xop->collect[clindex];
+
+	if ((chain || bref) && (xop->flags & HAMMER2_XOP_FIFO_BOUND)) {
+		int bound = xop->fifo_bound ? xop->fifo_bound :
+		    HAMMER2_XOPFIFO_BOUND;
+		if (fifo->wi >= bound) {
+			error = HAMMER2_ERROR_ABORTED;
+			goto done;
+		}
+	}
+
 	while (fifo->ri == fifo->wi - xop->fifo_size) {
 		if ((xop->run_mask & HAMMER2_XOPMASK_VOP) == 0) {
 			error = HAMMER2_ERROR_ABORTED;
@@ -758,13 +834,15 @@ hammer2_xop_feed(hammer2_xop_head_t *xop, hammer2_chain_t *chain, int clindex,
 		 * on every call.  The caller resumes from its cursor.
 		 */
 		if ((xop->flags & HAMMER2_XOP_FIFO_BOUND) &&
-		    xop->fifo_size >= HAMMER2_XOPFIFO_BOUND) {
+		    xop->fifo_size >= (xop->fifo_bound ? xop->fifo_bound :
+		    HAMMER2_XOPFIFO_BOUND)) {
 			error = HAMMER2_ERROR_ABORTED;
 			goto done;
 		}
 		old_fifo_size = xop->fifo_size;
 		xop->fifo_size *= 2;
-		hammer2_xop_fifo_alloc(fifo, xop->fifo_size, old_fifo_size);
+		hammer2_xop_fifo_alloc(fifo, xop->fifo_size, old_fifo_size,
+		    xop->flags & HAMMER2_XOP_FIFO_BREF);
 	}
 
 	if (chain)
@@ -773,10 +851,73 @@ hammer2_xop_feed(hammer2_xop_head_t *xop, hammer2_chain_t *chain, int clindex,
 		error = chain->error;
 	fifo->errors[fifo->wi & fifo_mask(xop)] = error;
 	fifo->array[fifo->wi & fifo_mask(xop)] = chain;
+	if (bref) {
+		fifo->brefs[fifo->wi & fifo_mask(xop)] = *bref;
+	} else if (xop->flags & HAMMER2_XOP_FIFO_BREF) {
+
+		fifo->brefs[fifo->wi & fifo_mask(xop)].type =
+		    HAMMER2_BREF_TYPE_EMPTY;
+	}
 	++fifo->wi;
 
 	error = 0;
 done:
+	return (error);
+}
+
+
+int
+hammer2_xop_feed(hammer2_xop_head_t *xop, hammer2_chain_t *chain, int clindex,
+    int error)
+{
+	return (hammer2_xop_feed_slot(xop, chain, NULL, clindex, error));
+}
+
+
+int
+hammer2_xop_feed_bref(hammer2_xop_head_t *xop, const hammer2_blockref_t *bref,
+    hammer2_chain_t *chain, int clindex, int error)
+{
+	KKASSERT(xop->flags & HAMMER2_XOP_FIFO_BREF);
+	KKASSERT(bref != NULL && bref->type != HAMMER2_BREF_TYPE_EMPTY);
+
+	return (hammer2_xop_feed_slot(xop, chain, bref, clindex, error));
+}
+
+int
+hammer2_xop_collect_bref(hammer2_xop_head_t *xop, hammer2_blockref_t *brefp,
+    hammer2_chain_t **chainp)
+{
+	hammer2_xop_fifo_t *fifo = &xop->collect[0];
+	int error, i;
+
+	KKASSERT(xop->flags & HAMMER2_XOP_FIFO_BREF);
+	KKASSERT(xop->cluster.nchains == 1);
+
+	*chainp = NULL;
+
+
+	if (xop->cluster.array[0].chain) {
+		hammer2_chain_drop_unhold(xop->cluster.array[0].chain);
+		xop->cluster.array[0].chain = NULL;
+	}
+
+	if (fifo->ri == fifo->wi)
+		return (HAMMER2_ERROR_ENOENT);
+
+	i = fifo->ri & fifo_mask(xop);
+	error = fifo->errors[i];
+	*chainp = fifo->array[i];
+	*brefp = fifo->brefs[i];
+	xop->cluster.array[0].chain = *chainp;
+	++fifo->ri;
+
+
+	if (brefp->type == HAMMER2_BREF_TYPE_EMPTY) {
+		if (error == 0 || error == HAMMER2_ERROR_ABORTED)
+			return (HAMMER2_ERROR_ENOENT);
+		return (error);
+	}
 	return (error);
 }
 
