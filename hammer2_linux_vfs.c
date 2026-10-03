@@ -1391,7 +1391,7 @@ hammer2_create_obj(struct inode *dir, struct dentry *dentry, umode_t mode,
 
 static int
 hammer2_create(struct mnt_idmap *idmap, struct inode *dir,
-    struct dentry *dentry, umode_t mode, bool excl)
+    struct dentry *dentry, umode_t mode)
 {
 	struct inode *inode = hammer2_create_obj(dir, dentry, mode, 0, NULL);
 
